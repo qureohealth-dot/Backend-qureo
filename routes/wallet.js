@@ -560,7 +560,7 @@ router.post('/withdraw', async (req, res) => {
 // Pay provider
 router.post('/pay-provider', async (req, res) => {
   try {
-    const { userId, providerId, amount, serviceDetails, type } = req.body;
+    const { userId, providerId, amount, serviceDetails, type, dependentId = null } = req.body;
 
     if (!userId) return res.status(400).json({ error: 'userId is required' });
     if (!providerId || !amount || amount <= 0) {
@@ -578,6 +578,19 @@ router.post('/pay-provider', async (req, res) => {
       const wallet = await Wallet.findOne({ user: userId }).session(session);
       if (!wallet) throw new Error('User wallet not found');
 
+      let dependent = null;
+      let dependentAllocation = null;
+      if (dependentId) {
+        dependent = await Dependent.findOne({ _id: dependentId, owner: userId, active: true }).session(session);
+        if (!dependent) throw new Error('Selected dependent is invalid');
+        dependentAllocation = (wallet.dependentSupportAllocations || []).find(
+          (allocation) => String(allocation.dependentId) === String(dependentId) && allocation.active
+        );
+        if (!dependentAllocation || Number(dependentAllocation.availableAmount || 0) < Number(amount)) {
+          throw new Error('Insufficient dependent wallet balance');
+        }
+      }
+
       if (wallet.balance < amount) {
         throw new Error('Insufficient balance');
       }
@@ -586,6 +599,10 @@ router.post('/pay-provider', async (req, res) => {
       const newBalance = previousBalance - parseFloat(amount);
 
       wallet.balance = newBalance;
+      if (dependentAllocation) {
+        dependentAllocation.availableAmount = Number(dependentAllocation.availableAmount || 0) - Number(amount);
+        wallet.reservedFunds.familySupport = Math.max(0, Number(wallet.reservedFunds.familySupport || 0) - Number(amount));
+      }
       wallet.lastTransaction = new Date();
       await wallet.save({ session });
 
@@ -612,9 +629,10 @@ router.post('/pay-provider', async (req, res) => {
         newBalance,
         status: 'completed',
         paymentMethod: 'wallet',
+        dependentId,
         description: serviceDetails || 'healthcare service',
         reference: `PAY-${Date.now()}`,
-        metadata: { serviceDetails },
+        metadata: { serviceDetails, walletSource: dependent ? `dependent:${dependent._id}` : 'health' },
         completedAt: new Date()
       });
 
