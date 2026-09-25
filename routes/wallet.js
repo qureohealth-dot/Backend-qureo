@@ -385,9 +385,28 @@ router.post("/top-up", async (req, res) => {
   const body = req.body.data || req.body || {};
   try {
     const receiverId = body.receiverId || body.reciverId;
-    const { amount, senderName, senderContact, paymentMethod = 'external_transfer' } = body;
+    const { amount, senderId = null, senderName, senderContact, paymentMethod = 'external_transfer' } = body;
     if (!receiverId || !Number.isFinite(Number(amount)) || Number(amount) <= 0) {
       return res.status(400).json({ success: false, message: "Missing required fields" });
+    }
+
+    if (senderId && String(senderId) === String(receiverId)) {
+      return res.status(400).json({ success: false, message: "Sender and receiver must be different" });
+    }
+
+    const transferAmount = Number(amount);
+    let senderWallet = null;
+    let senderPreviousBalance = null;
+    if (senderId) {
+      senderWallet = await Wallet.findOne({ user: senderId }).session(session);
+      if (!senderWallet) {
+        return res.status(404).json({ success: false, message: "Sender wallet not found" });
+      }
+
+      senderPreviousBalance = Number(senderWallet.balance || 0);
+      if (senderPreviousBalance < transferAmount) {
+        return res.status(400).json({ success: false, message: "Insufficient sender wallet balance" });
+      }
     }
 
     let wallet = await Wallet.findOne({ user: receiverId }).session(session);
@@ -395,25 +414,53 @@ router.post("/top-up", async (req, res) => {
       wallet = new Wallet({ user: receiverId, balance: 0 });
     }
 
-    const previousBalance = wallet.balance;
-    const newBalance = previousBalance + parseFloat(amount);
+    const previousBalance = Number(wallet.balance || 0);
+    const newBalance = previousBalance + transferAmount;
 
     wallet.balance = newBalance;
-    wallet.totalDeposits += parseFloat(amount);
+    wallet.totalDeposits = Number(wallet.totalDeposits || 0) + transferAmount;
     wallet.lastTransaction = new Date();
     await wallet.save({ session });
+
+    let senderTransaction = null;
+    if (senderWallet) {
+      const senderNewBalance = senderPreviousBalance - transferAmount;
+      senderWallet.balance = senderNewBalance;
+      senderWallet.totalWithdrawals = Number(senderWallet.totalWithdrawals || 0) + transferAmount;
+      senderWallet.lastTransaction = new Date();
+      await senderWallet.save({ session });
+
+      senderTransaction = new Transaction({
+        wallet: senderWallet._id,
+        user: senderId,
+        type: 'wallet_transfer_sent',
+        amount: transferAmount,
+        previousBalance: senderPreviousBalance,
+        newBalance: senderNewBalance,
+        status: 'completed',
+        paymentMethod: paymentMethod || 'wallet',
+        fundingSource: 'walletBalance',
+        description: `Transferred funds to ${receiverId}`,
+        reference: `DEP-${Date.now()}-SENDER`,
+        metadata: { senderId, receiverId, senderContact: String(senderContact || '') },
+        completedAt: new Date(),
+      });
+      await senderTransaction.save({ session });
+    }
 
     const transaction = new Transaction({
       wallet: wallet._id,
       user: receiverId,
       type: "deposit",
-      amount: parseFloat(amount),
+      amount: transferAmount,
       previousBalance,
       newBalance,
       status: "completed",
       paymentMethod,
-      description: `Deposit of ₦${amount} from ${senderName || "Unknown"}`,
-      reference: `DEP-${Date.now()}`,
+      fundingSource: senderId ? 'walletBalance' : undefined,
+      description: `${senderId ? 'Transfer' : 'Deposit'} of ₦${amount} from ${senderName || senderId || "Unknown"}`,
+      reference: `DEP-${Date.now()}${senderId ? '-RECEIVER' : ''}`,
+      metadata: senderId ? { senderId, receiverId, senderContact: String(senderContact || '') } : undefined,
       completedAt: new Date(),
     });
     await transaction.save({ session });
@@ -436,6 +483,7 @@ router.post("/top-up", async (req, res) => {
           transactionId: String(transaction._id),
           amount: String(amount),
           senderName: String(senderName || ''),
+          senderId: String(senderId || ''),
         },
       });
     } catch (notifyError) {
@@ -449,6 +497,8 @@ router.post("/top-up", async (req, res) => {
       data: {
         walletBalance: wallet.balance,
         transactionId: transaction._id,
+        senderBalance: senderWallet ? senderWallet.balance : undefined,
+        senderTransactionId: senderTransaction?._id,
       },
     });
   } catch (error) {
@@ -1322,7 +1372,7 @@ router.post('/dependents/:id/allowance', async (req, res) => {
         throw new Error('Insufficient wallet balance to create this allowance');
       }
 
-      if (dependent.linkedUser && dependent.careAccessMode === 'linked_wallet') {
+      if (dependent.linkedUser) {
         const allocatedAmount = (wallet.dependentSupportAllocations || [])
           .filter((allocation) => allocation.active)
           .reduce((sum, allocation) => sum + Number(allocation.availableAmount || 0), 0);

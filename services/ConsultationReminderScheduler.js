@@ -113,6 +113,7 @@ class ConsultationReminderScheduler {
   async _notify(consultation, { title, body, type, flag, ring }) {
     const patientId = String(consultation.patient);
     const roomId = consultation.roomId;
+    let delivered = false;
 
     // --- Push notification ---
     const tokenDoc = await NotificationToken.findOne({ userId: patientId }).lean();
@@ -132,6 +133,7 @@ class ConsultationReminderScheduler {
 
       if (result.success) {
         this.stats.pushSent += 1;
+        delivered = true;
         console.log(`[consultation-reminder] Push sent to patient ${patientId} (${type})`);
       } else {
         this.stats.failed += 1;
@@ -142,24 +144,29 @@ class ConsultationReminderScheduler {
     // --- Email fallback ---
     if (consultation.patientEmail) {
       try {
-        await sendEmail({
-          to: consultation.patientEmail,
-          subject: title,
-          text: body,
-          html: `<p>${body}</p><p><a href="https://app.qureohealth.com/call/${roomId}">Join consultation</a></p>`,
-        });
-        this.stats.emailSent += 1;
-        console.log(`[consultation-reminder] Email sent to ${consultation.patientEmail} (${type})`);
+        const emailSent = await sendEmail(
+          consultation.patientEmail,
+          title,
+          body,
+          `<p>${body}</p><p><a href="https://app.qureohealth.com/call/${roomId}">Join consultation</a></p>`
+        );
+        if (emailSent) {
+          delivered = true;
+          this.stats.emailSent += 1;
+          console.log(`[consultation-reminder] Email sent to ${consultation.patientEmail} (${type})`);
+        }
       } catch (err) {
         console.warn(`[consultation-reminder] Email failed for ${consultation.patientEmail}: ${err.message}`);
       }
     }
 
-    // --- Mark flag so we don't re-notify ---
-    await Consultation.updateOne(
-      { _id: consultation._id },
-      { $set: { [flag]: true } }
-    );
+    // Do not consume the reminder when every delivery channel failed.
+    if (delivered) {
+      await Consultation.updateOne(
+        { _id: consultation._id },
+        { $set: { [flag]: true } }
+      );
+    }
   }
 }
 
