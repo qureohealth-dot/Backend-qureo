@@ -49,10 +49,27 @@ const MOTIVATIONAL_TEMPLATES = {
 const REPEAT_VALUES = new Set(['Daily', 'Weekdays', 'Weekends', 'Custom']);
 const DAY_VALUES = new Set(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']);
 
-function toDateKey(date = new Date()) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
+function isValidTimezone(timezone) {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format(new Date());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function toDateKey(date = new Date(), timezone = 'UTC') {
+  const safeTimezone = isValidTimezone(timezone) ? timezone : 'UTC';
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: safeTimezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date);
+
+  const year = parts.find((part) => part.type === 'year')?.value;
+  const month = parts.find((part) => part.type === 'month')?.value;
+  const day = parts.find((part) => part.type === 'day')?.value;
   return `${year}-${month}-${day}`;
 }
 
@@ -66,6 +83,32 @@ function clampNumber(value, min, max) {
   const number = Number(value);
   if (Number.isNaN(number)) return min;
   return Math.min(max, Math.max(min, number));
+}
+
+function getTrackerTimezone(goal) {
+  const timezone = goal?.habitTracker?.timezone;
+  return typeof timezone === 'string' && isValidTimezone(timezone) ? timezone : 'UTC';
+}
+
+function listDateKeys(startKey, endKey) {
+  const [startYear, startMonth, startDay] = String(startKey).split('-').map(Number);
+  const [endYear, endMonth, endDay] = String(endKey).split('-').map(Number);
+  const current = new Date(Date.UTC(startYear, startMonth - 1, startDay));
+  const end = new Date(Date.UTC(endYear, endMonth - 1, endDay));
+  const dateKeys = [];
+
+  while (current <= end) {
+    dateKeys.push(current.toISOString().slice(0, 10));
+    current.setUTCDate(current.getUTCDate() + 1);
+  }
+
+  return dateKeys;
+}
+
+function areConsecutiveDateKeys(previousKey, currentKey) {
+  const previous = new Date(`${previousKey}T00:00:00Z`);
+  const current = new Date(`${currentKey}T00:00:00Z`);
+  return current.getTime() - previous.getTime() === 24 * 60 * 60 * 1000;
 }
 
 function normalizeSelectedHabits(input) {
@@ -217,8 +260,8 @@ async function getOrCreateEntry(userId, dateKey, selectedHabits) {
 
 async function applyHabitLog({ userId, habitKey, value = 1, action = 'log', label, mood, weight }) {
   const now = new Date();
-  const dateKey = toDateKey(now);
   const goal = await getOrCreateGoal(userId);
+  const dateKey = toDateKey(now, getTrackerTimezone(goal));
   const selectedHabits = normalizeSelectedHabits(goal?.habitTracker?.selectedHabits || []);
   const entry = await getOrCreateEntry(userId, dateKey, selectedHabits);
 
@@ -403,10 +446,12 @@ router.put('/config', auth, async (req, res) => {
 router.get('/dashboard', auth, async (req, res) => {
   try {
     const userId = req.userId || req.user?._id;
-    const requestedDate = parseDateKey(req.query?.date);
-    const dateKey = toDateKey(requestedDate);
-
     const goal = await getOrCreateGoal(userId);
+    const timezone = getTrackerTimezone(goal);
+    const requestedDate = parseDateKey(req.query?.date);
+    const dateKey = req.query?.date
+      ? toDateKey(requestedDate, 'UTC')
+      : toDateKey(new Date(), timezone);
     const selectedHabits = normalizeSelectedHabits(goal?.habitTracker?.selectedHabits || []);
 
     const entry = await getOrCreateEntry(userId, dateKey, selectedHabits);
@@ -622,8 +667,8 @@ router.post('/quick-action', auth, async (req, res) => {
 router.get('/motivations', auth, async (req, res) => {
   try {
     const userId = req.userId || req.user?._id;
-    const dateKey = toDateKey(new Date());
     const goal = await getOrCreateGoal(userId);
+    const dateKey = toDateKey(new Date(), getTrackerTimezone(goal));
     const selectedHabits = normalizeSelectedHabits(goal?.habitTracker?.selectedHabits || []);
     const entry = await getOrCreateEntry(userId, dateKey, selectedHabits);
     const messages = buildMotivationalMessages(selectedHabits, entry.habits);
@@ -639,13 +684,28 @@ router.get('/stats', auth, async (req, res) => {
   try {
     const userId = req.userId || req.user?._id;
     const range = String(req.query?.range || 'week').toLowerCase();
-    const now = new Date();
-
-    const startDate = getRangeStart(range, now);
-    const startKey = toDateKey(startDate);
-    const endKey = toDateKey(now);
-
     const goal = await getOrCreateGoal(userId);
+    const timezone = getTrackerTimezone(goal);
+    const now = new Date();
+    const endKey = toDateKey(now, timezone);
+    const endDate = new Date(`${endKey}T00:00:00Z`);
+    const startDate = new Date(endDate);
+
+    if (range === 'today') {
+      // Keep the current local day as the only stats day.
+    } else if (range === 'month') {
+      startDate.setUTCMonth(startDate.getUTCMonth() - 1);
+      startDate.setUTCDate(startDate.getUTCDate() + 1);
+    } else if (range === 'year') {
+      startDate.setUTCFullYear(startDate.getUTCFullYear() - 1);
+      startDate.setUTCDate(startDate.getUTCDate() + 1);
+    } else {
+      startDate.setUTCDate(startDate.getUTCDate() - 6);
+    }
+
+    const startKey = startDate.toISOString().slice(0, 10);
+    const dateKeys = listDateKeys(startKey, endKey);
+
     const selectedHabits = normalizeSelectedHabits(goal?.habitTracker?.selectedHabits || []);
 
     const entries = await HabitTrackerEntry.find({
@@ -655,11 +715,13 @@ router.get('/stats', auth, async (req, res) => {
       .sort({ dateKey: 1 })
       .lean();
 
-    const daysInRange = Math.max(1, Math.ceil((now.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24)) + 1);
+    const daysInRange = dateKeys.length;
+    const entriesByDate = new Map(entries.map((entry) => [entry.dateKey, entry]));
 
     const habits = selectedHabits.map((habitKey) => {
       const def = HABIT_DEFINITIONS[habitKey];
-      const history = entries.map((entry) => {
+      const history = dateKeys.map((dateKey) => {
+        const entry = entriesByDate.get(dateKey);
         const state = entry?.habits?.[habitKey];
         const target = Number(state?.target || def.target || 1);
         const progress = Number(state?.progress || 0);
@@ -684,7 +746,10 @@ router.get('/stats', auth, async (req, res) => {
       let activeStreak = 0;
       history.forEach((item) => {
         if (item.completed) {
-          activeStreak += 1;
+          const previous = history[history.indexOf(item) - 1];
+          activeStreak = previous?.completed && areConsecutiveDateKeys(previous.dateKey, item.dateKey)
+            ? activeStreak + 1
+            : 1;
           longestStreak = Math.max(longestStreak, activeStreak);
         } else {
           activeStreak = 0;
@@ -692,7 +757,10 @@ router.get('/stats', auth, async (req, res) => {
       });
 
       for (let i = history.length - 1; i >= 0; i -= 1) {
-        if (history[i].completed) currentStreak += 1;
+        if (
+          history[i].completed &&
+          (currentStreak === 0 || areConsecutiveDateKeys(history[i].dateKey, history[i + 1]?.dateKey))
+        ) currentStreak += 1;
         else break;
       }
 
@@ -738,9 +806,12 @@ router.get('/achievements', auth, async (req, res) => {
     let currentStreak = 0;
     let longestStreak = 0;
     let active = 0;
-    entries.forEach((entry) => {
+    entries.forEach((entry, index) => {
       if (Number(entry.healthScore || 0) >= 80) {
-        active += 1;
+        const previous = entries[index - 1];
+        active = previous && Number(previous.healthScore || 0) >= 80 && areConsecutiveDateKeys(previous.dateKey, entry.dateKey)
+          ? active + 1
+          : 1;
         longestStreak = Math.max(longestStreak, active);
       } else {
         active = 0;
@@ -748,7 +819,10 @@ router.get('/achievements', auth, async (req, res) => {
     });
 
     for (let i = entries.length - 1; i >= 0; i -= 1) {
-      if (Number(entries[i].healthScore || 0) >= 80) currentStreak += 1;
+      if (
+        Number(entries[i].healthScore || 0) >= 80 &&
+        (currentStreak === 0 || areConsecutiveDateKeys(entries[i].dateKey, entries[i + 1]?.dateKey))
+      ) currentStreak += 1;
       else break;
     }
 
