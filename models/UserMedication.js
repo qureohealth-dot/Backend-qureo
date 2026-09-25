@@ -28,6 +28,7 @@ const userMedicationSchema = new mongoose.Schema(
     frequency: { type: String }, // "Once daily", "Twice daily", "Three times daily"
     duration: { type: String }, // "7 days", "30 days", "As needed"
     durationEndDate: { type: Date },
+    timezone: { type: String, default: 'UTC' },
     
     // Additional info
     instructions: { type: String }, // "Take with food", "Take on empty stomach"

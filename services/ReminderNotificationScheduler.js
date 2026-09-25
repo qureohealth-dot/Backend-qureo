@@ -64,6 +64,20 @@ const timeKeyToMinutes = (timeKey) => {
   return Number(match[1]) * 60 + Number(match[2]);
 };
 
+const medicationTimeToMinutes = (timeKey) => {
+  const value = String(timeKey || '').trim().toUpperCase();
+  const match = /^(\d{1,2}):(\d{2})(?:\s*(AM|PM))?$/.exec(value);
+  if (!match) return null;
+
+  let hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  const meridiem = match[3];
+  if (minutes > 59 || hours > (meridiem ? 12 : 23) || (meridiem && hours === 0)) return null;
+  if (meridiem === 'AM' && hours === 12) hours = 0;
+  if (meridiem === 'PM' && hours !== 12) hours += 12;
+  return hours * 60 + minutes;
+};
+
 const minutesToTimeKey = (minutes) => {
   const normalized = ((minutes % (24 * 60)) + (24 * 60)) % (24 * 60);
   const hours = Math.floor(normalized / 60);
@@ -265,6 +279,17 @@ class ReminderNotificationScheduler {
     return String(dose?.time || '');
   }
 
+  isWithinWindow(scheduledTime, now, windowMinutes = 5, timezone = 'UTC') {
+    const scheduledMinutes = medicationTimeToMinutes(scheduledTime);
+    const currentTime = formatTimeKeyInTimezone(now, timezone);
+    const currentMinutes = timeKeyToMinutes(currentTime);
+    if (scheduledMinutes === null || currentMinutes === null) return false;
+
+    const difference = Math.abs(scheduledMinutes - currentMinutes);
+    const wrappedDifference = (24 * 60) - difference;
+    return Math.min(difference, wrappedDifference) <= windowMinutes;
+  }
+
   async alreadyDispatched({ userId, medicationId, reminderDate, reminderTime, channel }) {
     const found = await ReminderDispatch.findOne({
       user: userId,
@@ -274,7 +299,7 @@ class ReminderNotificationScheduler {
       channel,
     }).lean();
 
-    return Boolean(found);
+    return Boolean(found?.success);
   }
 
   async alreadyDispatchedHabit({ userId, habitKey, reminderKey, reminderDate, reminderTime, channel }) {
@@ -426,8 +451,12 @@ async processDueReminders() {
  for (const medication of medications) {
   console.log("meds found for reporting", medication);
   try {
-    const user = await User.findById(medication.user).select("timezone");
-    const timezone = user?.timezone || "UTC";
+    const user = await User.findById(medication.user).select("email timezone").lean();
+    const timezone = isValidTimezone(medication.timezone)
+      ? medication.timezone
+      : isValidTimezone(user?.timezone)
+        ? user.timezone
+        : "UTC";
 
     await this.processMedicationReminder(medication, now, timezone);
   } catch (error) {
@@ -465,27 +494,40 @@ async processMedicationReminder(medication, now, timezone = "UTC") {
 
   const WINDOW_MINUTES = 5;
 
-  const dueDosage = dosages.find((dose) => {
-    if (dose.taken) return false;
+  const dueDosages = dosages.filter((dose) => {
+    if (dose.taken || this.isDoseSkippedTodayInTimezone(dose, now, timezone)) return false;
+    if (dose.snoozedUntil && new Date(dose.snoozedUntil) > now) return false;
     return this.isWithinWindow(dose.time, now, WINDOW_MINUTES, timezone);
-  });x
+  });
 
-  if (!dueDosage) {
+  if (!dueDosages.length) {
     console.log(`[Medication Reminder] No dosage due right now for ${_id}`);
     return;
   }
 
-  console.log(
-    `[Medication Reminder] Dosage due for ${medicineName} (user ${user}) at ${dueDosage.time}`
-  );
+  const userDoc = await User.findById(user).select('email timezone').lean();
+  const profile = await Profile.findOne({ user }).select('notifications').lean();
+  const tokenDoc = await NotificationToken.findOne({ userId: user }).lean();
+  const notifications = profile?.notifications || {};
+  const dateKey = formatDateKeyInTimezone(now, timezone);
+  const timeKey = formatTimeKeyInTimezone(now, timezone);
 
-  await this.notifyUser({
-    userId: user,
-    medicationId: _id,
-    dosageId: dueDosage._id,
-    title: "Time to take your medication",
-    body: `${medicineName} — scheduled dose at ${dueDosage.time}`,
-  });
+  for (const dose of dueDosages) {
+    console.log(
+      `[Medication Reminder] Dosage due for ${medicineName} (user ${user}) at ${dose.time}`
+    );
+
+    await this.processDoseReminder({
+      medication,
+      dose,
+      user: userDoc,
+      tokenDoc,
+      notifications,
+      userId: user,
+      dateKey,
+      timeKey: dose.time || timeKey,
+    });
+  }
 }
 /**
  * Process push and email reminders for a single dose.
