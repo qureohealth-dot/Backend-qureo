@@ -1,6 +1,9 @@
 const express = require("express");
 const router = express.Router();
 const Provider = require("../models/Provider");
+const Pharmacy = require("../models/Pharmacy");
+const HealthcareProvider = require("../models/HealthcareProvider");
+const LabTest = require("../models/LabTest");
 const jwt = require("jsonwebtoken");
 
 const JWT_SECRET = process.env.JWT_SECRET || "supersecret123";
@@ -76,7 +79,80 @@ router.post("/login", async (req, res) => {
   }
 });
 
-// 🔍 FIND provider by ID
+router.get("/health-wallet", async (req, res) => {
+  try {
+    const [paymentProviders, pharmacies, healthcareProviders, labNames] = await Promise.all([
+      Provider.find().select("name email phone address logo verified").lean(),
+      Pharmacy.find().select("name email phone address city logo verified").lean(),
+      HealthcareProvider.find({ isActive: { $ne: false } })
+        .select("name type address contactPhone contactEmail rating isVerified icon")
+        .lean(),
+      LabTest.distinct("laboratory", { laboratory: { $type: "string", $ne: "" } }),
+    ]);
+
+    const normalizedHealthcareProviders = healthcareProviders.map((provider) => ({
+      _id: `healthcare:${provider._id}`,
+      providerId: String(provider._id),
+      providerSource: "healthcare",
+      category: provider.type || "healthcare",
+      paymentEnabled: true,
+      name: provider.name,
+      email: provider.contactEmail,
+      phone: provider.contactPhone,
+      address: provider.address,
+      logo: provider.icon,
+      verified: Boolean(provider.isVerified),
+      rating: provider.rating,
+    }));
+    const registeredLabNames = new Set(
+      healthcareProviders
+        .filter((provider) => provider.type === "lab")
+        .map((provider) => String(provider.name || "").trim().toLowerCase())
+    );
+
+    const providers = [
+      ...paymentProviders.map((provider) => ({
+        ...provider,
+        _id: `payment:${provider._id}`,
+        providerId: String(provider._id),
+        providerSource: "payment",
+        category: "payment",
+        paymentEnabled: true,
+      })),
+      ...pharmacies.map((pharmacy) => ({
+        ...pharmacy,
+        _id: `pharmacy:${pharmacy._id}`,
+        providerId: String(pharmacy._id),
+        providerSource: "pharmacy",
+        category: "pharmacy",
+        paymentEnabled: true,
+        address: [pharmacy.address, pharmacy.city].filter(Boolean).join(", "),
+      })),
+      ...normalizedHealthcareProviders,
+      ...labNames
+        .map((name) => String(name || "").trim())
+        .filter((name) => name && !registeredLabNames.has(name.toLowerCase()))
+        .map((name) => ({
+          _id: `lab:${name.toLowerCase()}`,
+          providerId: null,
+          providerSource: "lab",
+          category: "lab",
+          paymentEnabled: false,
+          name,
+          phone: "",
+          logo: null,
+          verified: false,
+        })),
+    ];
+
+    return res.json({ providers });
+  } catch (err) {
+    console.error("Health wallet providers error:", err);
+    return res.status(500).json({ error: "Failed to fetch healthcare providers" });
+  }
+});
+
+// FIND provider by ID
 router.get("/:id", async (req, res) => {
   try {
     const provider = await Provider.findById(req.params.id);

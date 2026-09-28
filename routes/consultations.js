@@ -175,6 +175,7 @@ const resolveDurationMinutes = (duration, durationMinutes) => {
                 const sms = `Reminder: consultation with ${c.patient_?.name || 'a patient'} in 30 minutes at ${new Date(c.appointmentTime).toLocaleTimeString()}`;
                 await sendSMS(doctorPhone, sms);
               }
+              
             } catch (errDocNotify) {
               console.error('[consultation-check] Failed to notify doctor (30-min):', errDocNotify);
             }
@@ -478,11 +479,20 @@ router.get('/chat-sessions', auth, async (req, res) => {
     console.log('🔥 About to query Consultation');
 
     const consultations = await Consultation.find({
-      $or: [
-        { patient: objectUserId },
-        { doctor: objectUserId },
+      $and: [
+        {
+          $or: [
+            { patient: objectUserId },
+            { doctor: objectUserId },
+          ],
+        },
+        {
+          $or: [
+            { mode: 'chat' },
+            { chatSaved: true },
+          ],
+        },
       ],
-      mode: 'chat',
     })
       .sort({ updatedAt: -1 })
       .lean();
@@ -513,6 +523,69 @@ router.get('/chat-sessions', auth, async (req, res) => {
     });
   }
 });
+router.post('/room/:roomId/save-chat', auth, async (req, res) => {
+  try {
+    const consultation = await Consultation.findOne({ roomId: req.params.roomId });
+    if (!consultation) {
+      return res.status(404).json({ message: 'Consultation not found' });
+    }
+
+    const userId = String(req.userId || '');
+    const patientId = String(consultation.patient);
+    const doctorId = String(consultation.doctor);
+    if (userId !== patientId && userId !== doctorId) {
+      return res.status(403).json({ message: 'You are not allowed to save this consultation chat.' });
+    }
+
+    const messages = Array.isArray(req.body?.messages) ? req.body.messages.slice(0, 500) : [];
+    if (!messages.length) {
+      return res.status(400).json({ message: 'There are no chat messages to save.' });
+    }
+
+    const chat = messages.map((message) => {
+      const requestedRole = String(message?.sender || '').toLowerCase();
+      const senderRole = requestedRole === 'doctor' || requestedRole === 'patient'
+        ? requestedRole
+        : userId === patientId ? 'patient' : 'doctor';
+      const timestamp = new Date(message?.timestamp || message?.sentAt || Date.now());
+
+      return {
+        text: typeof message?.text === 'string' ? message.text : '',
+        attachments: [],
+        senderId: senderRole === 'patient' ? patientId : doctorId,
+        senderName: typeof message?.senderName === 'string' ? message.senderName : senderRole,
+        senderRole,
+        sentAt: Number.isNaN(timestamp.getTime()) ? new Date() : timestamp,
+      };
+    });
+
+    const mergedChat = [...(Array.isArray(consultation.chat) ? consultation.chat : [])];
+    const existingMessageKeys = new Set(mergedChat.map((message) => [
+      String(message.senderRole || ''),
+      String(message.text || ''),
+      new Date(message.sentAt || 0).getTime(),
+    ].join('|')));
+
+    for (const message of chat) {
+      const messageKey = [message.senderRole, message.text, message.sentAt.getTime()].join('|');
+      if (!existingMessageKeys.has(messageKey)) {
+        mergedChat.push(message);
+        existingMessageKeys.add(messageKey);
+      }
+    }
+
+    consultation.chat = mergedChat.sort((a, b) => new Date(a.sentAt) - new Date(b.sentAt));
+    consultation.chatSaved = true;
+    consultation.updatedAt = new Date();
+    await consultation.save();
+
+    return res.json({ success: true, consultationId: String(consultation._id), savedCount: chat.length });
+  } catch (err) {
+    console.error('[consultation-chat] Failed to save call transcript:', err);
+    return res.status(500).json({ message: 'Failed to save consultation chat.' });
+  }
+});
+
 router.get("/:id", async (req, res) => {
   try {
     const consultation = await Consultation.findById(req.params.id).lean();

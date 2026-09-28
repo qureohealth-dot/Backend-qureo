@@ -122,13 +122,30 @@ const isTodayAllowedInTimezone = (repeat, customDays, now = new Date(), timezone
   return true;
 };
 
+const normalizeTimezone = (timezone) => {
+  if (typeof timezone !== 'string') return '';
+  const trimmed = timezone.trim();
+  return trimmed || '';
+};
+
 const isValidTimezone = (timezone) => {
+  const safeTimezone = normalizeTimezone(timezone);
+  if (!safeTimezone) return false;
+
   try {
-    new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format(new Date());
+    new Intl.DateTimeFormat('en-US', { timeZone: safeTimezone }).format(new Date());
     return true;
   } catch {
     return false;
   }
+};
+
+const resolveMedicationTimezone = (medication = {}, user = {}) => {
+  const medicationTimezone = normalizeTimezone(medication?.timezone);
+  const userTimezone = normalizeTimezone(user?.timezone);
+  if (isValidTimezone(medicationTimezone)) return medicationTimezone;
+  if (isValidTimezone(userTimezone)) return userTimezone;
+  return 'UTC';
 };
 
 const normalizeReminderTimes = (timeList = []) =>
@@ -158,11 +175,11 @@ const buildHabitReminderEntries = (habitKey, settings = {}) => {
 
   if (habitKey === 'sleep') {
     return normalizeReminderTimes([
-      settings.sleepReminderEnabled === false ? null : settings.sleepTime || '22:00',
-      settings.wakeReminderEnabled === false ? null : settings.wakeTime || '06:30',
+      settings.sleepReminderEnabled === false || settings.sleepTimeConfigured !== true ? null : settings.sleepTime,
+      settings.wakeReminderEnabled === false || settings.wakeTimeConfigured !== true ? null : settings.wakeTime,
     ]).map((time) => ({
-      reminderKey: time === (settings.wakeTime || '06:30') ? 'wake-now' : 'sleep-now',
-      label: time === (settings.wakeTime || '06:30') ? 'Wake Now' : 'Sleep Now',
+      reminderKey: time === settings.wakeTime ? 'wake-now' : 'sleep-now',
+      label: time === settings.wakeTime ? 'Wake Now' : 'Sleep Now',
       time,
     }));
   }
@@ -181,6 +198,12 @@ const buildHabitReminderEntries = (habitKey, settings = {}) => {
       label: 'Medication',
       time,
     }));
+  }
+
+  if (habitKey === 'exercise') {
+    return settings.timeConfigured === true && settings.time
+      ? [{ reminderKey: `time-${settings.time}`, label: 'Reminder', time: settings.time }]
+      : [];
   }
 
   const baseTime = settings.time || settings.startTime || null;
@@ -280,8 +303,10 @@ class ReminderNotificationScheduler {
   }
 
   isWithinWindow(scheduledTime, now, windowMinutes = 5, timezone = 'UTC') {
-    const scheduledMinutes = medicationTimeToMinutes(scheduledTime);
-    const currentTime = formatTimeKeyInTimezone(now, timezone);
+    const normalizedTime = String(scheduledTime || '').trim();
+    const scheduledMinutes = medicationTimeToMinutes(normalizedTime);
+    const safeTimezone = isValidTimezone(timezone) ? timezone : 'UTC';
+    const currentTime = formatTimeKeyInTimezone(now, safeTimezone);
     const currentMinutes = timeKeyToMinutes(currentTime);
     if (scheduledMinutes === null || currentMinutes === null) return false;
 
@@ -441,31 +466,24 @@ async processDueReminders() {
     isCompleted: false,
   }).lean();
 
-
   if (!medications.length) {
-     console.log("meds found for reporting")
     return;
-   
   }
 
- for (const medication of medications) {
-  console.log("meds found for reporting", medication);
-  try {
-    const user = await User.findById(medication.user).select("email timezone").lean();
-    const timezone = isValidTimezone(medication.timezone)
-      ? medication.timezone
-      : isValidTimezone(user?.timezone)
-        ? user.timezone
-        : "UTC";
+  for (const medication of medications) {
+    try {
+      const user = await User.findById(medication.user).select('email timezone').lean();
+      const timezone = resolveMedicationTimezone(medication, user);
+      console.log(`[Medication Reminder] Checking ${medication._id} in timezone ${timezone}`);
 
-    await this.processMedicationReminder(medication, now, timezone);
-  } catch (error) {
-    console.error(
-      `[Medication Reminder] Failed for ${medication._id}:`,
-      error
-    );
+      await this.processMedicationReminder(medication, now, timezone);
+    } catch (error) {
+      console.error(
+        `[Medication Reminder] Failed for ${medication._id}:`,
+        error
+      );
+    }
   }
-}
 }
 
 /**

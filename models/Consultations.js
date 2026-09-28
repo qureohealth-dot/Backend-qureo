@@ -24,6 +24,7 @@ const consultationSchema = new mongoose.Schema({
     senderRole: { type: String, enum: ['patient', 'doctor'], required: true },
     sentAt: { type: Date, default: Date.now },
   }],
+  chatSaved: { type: Boolean, default: false },
   roomId: { type: String, required: true, unique: true },
   status: {
     type: String,

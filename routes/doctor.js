@@ -602,6 +602,40 @@ router.post("/:id/rate", async (req, res) => {
   }
 });
 
+router.get('/location-name', async (req, res) => {
+  const lat = Number(req.query.lat);
+  const lon = Number(req.query.lon);
+
+  if (!Number.isFinite(lat) || lat < -90 || lat > 90 || !Number.isFinite(lon) || lon < -180 || lon > 180) {
+    return res.status(400).json({ message: 'Valid latitude and longitude are required' });
+  }
+
+  try {
+    const url = new URL('https://nominatim.openstreetmap.org/reverse');
+    url.searchParams.set('format', 'jsonv2');
+    url.searchParams.set('lat', String(lat));
+    url.searchParams.set('lon', String(lon));
+
+    const response = await fetch(url, {
+      headers: { 'User-Agent': 'QureoHealth/1.0 (location lookup)' },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!response.ok) {
+      return res.status(502).json({ message: 'Location lookup is temporarily unavailable' });
+    }
+
+    const result = await response.json();
+    const address = result.address || {};
+    const name = address.city || address.town || address.village || address.suburb ||
+      address.neighbourhood || address.county || result.display_name || '';
+
+    return res.json({ name });
+  } catch (error) {
+    console.warn('[doctor] Reverse geocoding failed:', error?.message || error);
+    return res.status(502).json({ message: 'Location lookup is temporarily unavailable' });
+  }
+});
+
 router.get("/:id", async (req, res) => {
   const { id } = req.params;
 

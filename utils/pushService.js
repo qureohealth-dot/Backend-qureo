@@ -246,8 +246,8 @@ async function sendPushToToken(token, title, body, data = {}) {
     if (shouldRing) {
       androidNotification.sound = 'qureo_alarm';
       androidNotification.vibrate = [0, 500, 200, 500, 200, 1000];
-      androidNotification.lightSettings = { color: '#FF5722', lightOnDuration: 500, lightOffDuration: 500 };
-      androidNotification.visibility = 1;
+      androidNotification.lightSettings = { color: '#FF5722', lightOnDurationMillis: 500, lightOffDurationMillis: 500 };
+      androidNotification.visibility = 'public';
       androidNotification.audioAttributes = {
         usage: 2,
         flags: 64,
@@ -340,8 +340,8 @@ async function sendPushToMultipleTokens(tokens, title, body, data = {}) {
     if (shouldRing) {
       androidNotification.sound = 'qureo_alarm';
       androidNotification.vibrate = [0, 500, 200, 500, 200, 1000];
-      androidNotification.lightSettings = { color: '#FF5722', lightOnDuration: 500, lightOffDuration: 500 };
-      androidNotification.visibility = 1;
+      androidNotification.lightSettings = { color: '#FF5722', lightOnDurationMillis: 500, lightOffDurationMillis: 500 };
+      androidNotification.visibility = 'public';
       androidNotification.audioAttributes = { usage: 2, flags: 64 };
     } else {
       androidNotification.sound = 'default';

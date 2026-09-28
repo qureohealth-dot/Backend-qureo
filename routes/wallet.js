@@ -9,6 +9,7 @@ const Profile = require('../models/Profile');
 const InsuranceSubscription = require('../models/InsuranceSubscription');
 const Stripe = require("stripe")
 const Provider = require("../models/Provider")
+const Pharmacy = require('../models/Pharmacy');
 const Dependent = require('../models/Dependent');
 const DonorVoucher = require('../models/DonorVoucher');
 const { notifyUser } = require('../utils/notifyUser');
@@ -123,6 +124,124 @@ const ensureWallet = async (userId, session = null) => {
   }
 
   return wallet;
+};
+
+const transferLinkedDependentAllocation = async (ownerWallet, dependent, session) => {
+  const allocation = (ownerWallet.dependentSupportAllocations || []).find(
+    (item) => String(item.dependentId) === String(dependent._id) && item.active
+  );
+  const amount = Number(allocation?.availableAmount || 0);
+  if (!allocation || amount <= 0 || !dependent.linkedUser) return null;
+
+  const ownerPreviousBalance = Number(ownerWallet.balance || 0);
+  if (ownerPreviousBalance < amount) return null;
+
+  const dependentWallet = await ensureWallet(dependent.linkedUser, session);
+  const dependentPreviousBalance = Number(dependentWallet.balance || 0);
+
+  ownerWallet.balance = ownerPreviousBalance - amount;
+  ownerWallet.totalWithdrawals = Number(ownerWallet.totalWithdrawals || 0) + amount;
+  ownerWallet.reservedFunds.familySupport = Math.max(
+    0,
+    Number(ownerWallet.reservedFunds?.familySupport || 0) - amount
+  );
+  ownerWallet.lastTransaction = new Date();
+  allocation.availableAmount = 0;
+  allocation.active = false;
+  allocation.updatedAt = new Date();
+
+  dependentWallet.balance = dependentPreviousBalance + amount;
+  dependentWallet.totalDeposits = Number(dependentWallet.totalDeposits || 0) + amount;
+  dependentWallet.lastTransaction = new Date();
+
+  await ownerWallet.save({ session });
+  await dependentWallet.save({ session });
+
+  const reference = `DEP-LINK-TRANSFER-${Date.now()}`;
+  const senderTransaction = new Transaction({
+    wallet: ownerWallet._id,
+    user: ownerWallet.user,
+    dependentId: dependent._id,
+    type: 'dependent_wallet_transfer',
+    amount,
+    previousBalance: ownerPreviousBalance,
+    newBalance: ownerWallet.balance,
+    status: 'completed',
+    paymentMethod: 'wallet',
+    fundingSource: 'familySupport',
+    description: `Transferred allocated funds to ${dependent.fullName}`,
+    reference,
+    metadata: { dependentId: dependent._id, recipientUserId: dependent.linkedUser },
+    completedAt: new Date(),
+  });
+  await senderTransaction.save({ session });
+
+  const recipientTransaction = new Transaction({
+    wallet: dependentWallet._id,
+    user: dependent.linkedUser,
+    dependentId: dependent._id,
+    type: 'dependent_wallet_transfer_received',
+    amount,
+    previousBalance: dependentPreviousBalance,
+    newBalance: dependentWallet.balance,
+    status: 'completed',
+    paymentMethod: 'wallet',
+    fundingSource: 'familySupport',
+    description: 'Received allocated funds from your sponsor',
+    reference: `${reference}-RECEIVED`,
+    metadata: { dependentId: dependent._id, senderUserId: ownerWallet.user, reference },
+    completedAt: new Date(),
+  });
+  await recipientTransaction.save({ session });
+
+  return { amount, dependentWallet, recipientTransaction };
+};
+
+const linkDependentAndTransferAllocation = async ({ dependentId, ownerId, linkedUserId, linkedAccountEmail }) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    const dependent = await Dependent.findOne({ _id: dependentId, owner: ownerId, active: true }).session(session);
+    if (!dependent) {
+      await session.commitTransaction();
+      return null;
+    }
+
+    if (dependent.linkedUser && String(dependent.linkedUser) !== String(linkedUserId)) {
+      await session.commitTransaction();
+      return null;
+    }
+    if (!dependent.linkedUser && String(dependent.linkedAccountEmail || '').toLowerCase() !== String(linkedAccountEmail || '').toLowerCase()) {
+      await session.commitTransaction();
+      return null;
+    }
+
+    const needsLinkUpdate =
+      String(dependent.linkedUser || '') !== String(linkedUserId) ||
+      dependent.linkedAccountStatus !== 'linked' ||
+      dependent.careAccessMode !== 'linked_wallet';
+    if (needsLinkUpdate) {
+      dependent.linkedUser = linkedUserId;
+      dependent.linkedAccountStatus = 'linked';
+      dependent.careAccessMode = 'linked_wallet';
+      await dependent.save({ session });
+    }
+
+    const ownerWallet = await Wallet.findOne({ user: ownerId }).session(session);
+    if (!ownerWallet) {
+      await session.commitTransaction();
+      return { dependent, transfer: null };
+    }
+    const transfer = await transferLinkedDependentAllocation(ownerWallet, dependent, session);
+    await session.commitTransaction();
+    return { dependent, transfer };
+  } catch (error) {
+    await session.abortTransaction();
+    throw error;
+  } finally {
+    session.endSession();
+  }
 };
 // Get wallet balance (POST with userId in body)
 router.get("/list-of-wallets", async (req, res) => {
@@ -630,14 +749,20 @@ router.post('/pay-provider', async (req, res) => {
 
       let dependent = null;
       let dependentAllocation = null;
+      let linkedSponsorPayment = false;
       if (dependentId) {
         dependent = await Dependent.findOne({ _id: dependentId, owner: userId, active: true }).session(session);
-        if (!dependent) throw new Error('Selected dependent is invalid');
-        dependentAllocation = (wallet.dependentSupportAllocations || []).find(
-          (allocation) => String(allocation.dependentId) === String(dependentId) && allocation.active
-        );
-        if (!dependentAllocation || Number(dependentAllocation.availableAmount || 0) < Number(amount)) {
-          throw new Error('Insufficient dependent wallet balance');
+        if (dependent) {
+          dependentAllocation = (wallet.dependentSupportAllocations || []).find(
+            (allocation) => String(allocation.dependentId) === String(dependentId) && allocation.active
+          );
+          if (!dependentAllocation || Number(dependentAllocation.availableAmount || 0) < Number(amount)) {
+            throw new Error('Insufficient dependent wallet balance');
+          }
+        } else {
+          dependent = await Dependent.findOne({ _id: dependentId, linkedUser: userId, active: true }).session(session);
+          if (!dependent) throw new Error('Selected family sponsor is not linked to this account');
+          linkedSponsorPayment = true;
         }
       }
 
@@ -682,7 +807,14 @@ router.post('/pay-provider', async (req, res) => {
         dependentId,
         description: serviceDetails || 'healthcare service',
         reference: `PAY-${Date.now()}`,
-        metadata: { serviceDetails, walletSource: dependent ? `dependent:${dependent._id}` : 'health' },
+        metadata: {
+          serviceDetails,
+          walletSource: linkedSponsorPayment
+            ? `family-sponsor:${dependent.owner}`
+            : dependent
+              ? `dependent:${dependent._id}`
+              : 'health',
+        },
         completedAt: new Date()
       });
 
@@ -1292,17 +1424,50 @@ router.get('/dependents', async (req, res) => {
     for (const pending of pendingDependents) {
       const linkedUser = await User.findOne({ email: pending.linkedAccountEmail }).select('_id');
       if (linkedUser) {
-        pending.linkedUser = linkedUser._id;
-        pending.linkedAccountStatus = 'linked';
-        pending.careAccessMode = 'linked_wallet';
-        await pending.save();
+        await linkDependentAndTransferAllocation({
+          dependentId: pending._id,
+          ownerId: userId,
+          linkedUserId: linkedUser._id,
+          linkedAccountEmail: pending.linkedAccountEmail,
+        });
       }
+    }
+
+    const linkedOwnedDependents = await Dependent.find({ owner: userId, active: true, linkedUser: { $ne: null } });
+    for (const dependent of linkedOwnedDependents) {
+      await linkDependentAndTransferAllocation({
+        dependentId: dependent._id,
+        ownerId: userId,
+        linkedUserId: dependent.linkedUser,
+        linkedAccountEmail: dependent.linkedAccountEmail,
+      });
     }
 
     const dependents = await Dependent.find({ owner: userId, active: true })
       .sort({ createdAt: -1 })
       .populate('linkedUser', 'fullName email');
-    return res.json({ success: true, dependents });
+    const dependentIds = dependents.map((dependent) => dependent._id);
+    const transferTotals = await Transaction.aggregate([
+      {
+        $match: {
+          user: new mongoose.Types.ObjectId(userId),
+          dependentId: { $in: dependentIds },
+          type: 'dependent_wallet_transfer',
+          status: 'completed',
+        },
+      },
+      { $group: { _id: '$dependentId', totalTransferred: { $sum: '$amount' } } },
+    ]);
+    const transferredByDependent = new Map(
+      transferTotals.map((item) => [String(item._id), Number(item.totalTransferred || 0)])
+    );
+    return res.json({
+      success: true,
+      dependents: dependents.map((dependent) => ({
+        ...dependent.toObject(),
+        transferredAmount: transferredByDependent.get(String(dependent._id)) || 0,
+      })),
+    });
   } catch (error) {
     return res.status(500).json({ error: error.message });
   }
@@ -1310,18 +1475,83 @@ router.get('/dependents', async (req, res) => {
 
 router.get('/dependents/linked-to-me', async (req, res) => {
   try {
-    const { userId } = req.query;
+    const queryUserId = req.query.userId;
+    const userId = Array.isArray(queryUserId) ? queryUserId[0] : queryUserId;
     if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+    const linkedUser = await User.findById(userId).select('_id email');
+    const normalizedEmail = String(linkedUser?.email || '').trim().toLowerCase();
+    if (normalizedEmail) {
+      const pendingDependents = await Dependent.find({
+        linkedAccountEmail: normalizedEmail,
+        linkedAccountStatus: 'pending',
+        active: true,
+      });
+      for (const pending of pendingDependents) {
+        const result = await linkDependentAndTransferAllocation({
+          dependentId: pending._id,
+          ownerId: pending.owner,
+          linkedUserId: userId,
+          linkedAccountEmail: normalizedEmail,
+        });
+        if (result?.transfer) {
+          try {
+            await notifyUser({
+              userId,
+              type: 'wallet_funded',
+              title: 'Dependent wallet funded',
+              body: `${result.transfer.amount.toFixed(2)} in family funds is now available in your wallet.`,
+              route: '/health-wallet',
+              data: {
+                transactionId: String(result.transfer.recipientTransaction._id),
+                amount: String(result.transfer.amount),
+              },
+            });
+          } catch (notifyError) {
+            console.warn('[wallet] push failed after linked dependent allocation transfer:', notifyError?.message || notifyError);
+          }
+        }
+      }
+    }
 
     const linkedDependents = await Dependent.find({ linkedUser: userId, active: true })
       .sort({ createdAt: -1 })
       .populate('owner', 'fullName email');
 
-    const ownerIds = [...new Set(linkedDependents.map((entry) => String(entry.owner?._id || entry.owner)).filter(Boolean))];
+    for (const dependent of linkedDependents) {
+      const ownerId = String(dependent.owner?._id || dependent.owner || '');
+      await linkDependentAndTransferAllocation({
+        dependentId: dependent._id,
+        ownerId,
+        linkedUserId: userId,
+        linkedAccountEmail: dependent.linkedAccountEmail,
+      });
+    }
+
+    const refreshedLinkedDependents = await Dependent.find({ linkedUser: userId, active: true })
+      .sort({ createdAt: -1 })
+      .populate('owner', 'fullName email');
+
+    const ownerIds = [...new Set(refreshedLinkedDependents.map((entry) => String(entry.owner?._id || entry.owner)).filter(Boolean))];
     const ownerWallets = await Wallet.find({ user: { $in: ownerIds } }).select('user dependentSupportAllocations');
     const walletByOwner = new Map(ownerWallets.map((wallet) => [String(wallet.user), wallet]));
+    const dependentWallet = await Wallet.findOne({ user: userId }).select('balance');
+    const receivedTotals = await Transaction.aggregate([
+      {
+        $match: {
+          user: new mongoose.Types.ObjectId(userId),
+          dependentId: { $in: refreshedLinkedDependents.map((entry) => entry._id) },
+          type: 'dependent_wallet_transfer_received',
+          status: 'completed',
+        },
+      },
+      { $group: { _id: '$dependentId', totalReceived: { $sum: '$amount' } } },
+    ]);
+    const receivedByDependent = new Map(
+      receivedTotals.map((item) => [String(item._id), Number(item.totalReceived || 0)])
+    );
 
-    const enriched = linkedDependents.map((entry) => {
+    const enriched = refreshedLinkedDependents.map((entry) => {
       const ownerId = String(entry.owner?._id || entry.owner || '');
       const ownerWallet = walletByOwner.get(ownerId);
       const allocation = (ownerWallet?.dependentSupportAllocations || []).find(
@@ -1330,6 +1560,8 @@ router.get('/dependents/linked-to-me', async (req, res) => {
 
       return {
         ...entry.toObject(),
+        dependentWalletBalance: Number(dependentWallet?.balance || 0),
+        totalReceivedFromSponsor: receivedByDependent.get(String(entry._id)) || 0,
         allowance: allocation
           ? {
               availableAmount: Number(allocation.availableAmount || 0),
@@ -1573,6 +1805,7 @@ router.post('/pay-approved-service', async (req, res) => {
     const {
       userId,
       providerId,
+      providerSource = 'payment',
       amount,
       serviceCategory,
       serviceDetails,
@@ -1598,7 +1831,13 @@ router.post('/pay-approved-service', async (req, res) => {
       }
     }
 
-    const provider = await Provider.findById(providerId);
+    const provider = providerSource === 'pharmacy'
+      ? await Pharmacy.findById(providerId)
+      : providerSource === 'healthcare'
+        ? await HealthcareProvider.findOne({ _id: providerId, isActive: { $ne: false } })
+        : providerSource === 'payment'
+          ? await Provider.findById(providerId)
+          : null;
     if (!provider) return res.status(404).json({ error: 'Provider not found' });
 
     const totalAmount = Number(amount);
@@ -1771,6 +2010,7 @@ router.post('/pay-approved-service', async (req, res) => {
         reference: `HLPAY-${Date.now()}`,
         metadata: {
           serviceDetails,
+          providerSource,
           insuranceApplied: normalizedSplit.insuranceCoverage > 0,
           insuranceSubscriptionId: activeSubscription?._id || null,
           insuranceCoverageServiceType: insuranceCoverageEntry?.serviceType || null,

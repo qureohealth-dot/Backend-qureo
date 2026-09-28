@@ -166,9 +166,16 @@ function normalizeReminderSettings(selectedHabits, reminderSettings) {
 
     if (habitKey === 'sleep') {
       normalized.sleepReminderEnabled = incoming.sleepReminderEnabled !== false;
-      normalized.sleepTime = isValidTime(incoming.sleepTime) ? incoming.sleepTime : '22:00';
+      normalized.sleepTime = isValidTime(incoming.sleepTime) ? incoming.sleepTime : '';
+      normalized.sleepTimeConfigured = incoming.sleepTimeConfigured === true && isValidTime(incoming.sleepTime);
       normalized.wakeReminderEnabled = incoming.wakeReminderEnabled !== false;
-      normalized.wakeTime = isValidTime(incoming.wakeTime) ? incoming.wakeTime : '06:30';
+      normalized.wakeTime = isValidTime(incoming.wakeTime) ? incoming.wakeTime : '';
+      normalized.wakeTimeConfigured = incoming.wakeTimeConfigured === true && isValidTime(incoming.wakeTime);
+    }
+
+    if (habitKey === 'exercise') {
+      normalized.time = isValidTime(incoming.time) ? incoming.time : '';
+      normalized.timeConfigured = incoming.timeConfigured === true && isValidTime(incoming.time);
     }
 
     result[habitKey] = normalized;
@@ -477,7 +484,7 @@ router.get('/dashboard', auth, async (req, res) => {
 
         if (habitKey === 'sleep') {
           const items = [];
-          if (settings?.sleepReminderEnabled !== false && settings?.sleepTime) {
+          if (settings?.sleepReminderEnabled !== false && settings?.sleepTimeConfigured === true && settings?.sleepTime) {
             items.push({
               habitKey,
               title,
@@ -488,7 +495,7 @@ router.get('/dashboard', auth, async (req, res) => {
               enabled,
             });
           }
-          if (settings?.wakeReminderEnabled !== false && settings?.wakeTime) {
+          if (settings?.wakeReminderEnabled !== false && settings?.wakeTimeConfigured === true && settings?.wakeTime) {
             items.push({
               habitKey,
               title,
@@ -511,6 +518,8 @@ router.get('/dashboard', auth, async (req, res) => {
             enabled,
           }));
         }
+
+        if (habitKey === 'exercise' && settings?.timeConfigured !== true) return [];
 
         return [{
           habitKey,
