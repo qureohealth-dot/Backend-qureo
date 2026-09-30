@@ -138,6 +138,8 @@ const transferLinkedDependentAllocation = async (ownerWallet, dependent, session
 
   const dependentWallet = await ensureWallet(dependent.linkedUser, session);
   const dependentPreviousBalance = Number(dependentWallet.balance || 0);
+  const sponsor = await User.findById(ownerWallet.user).select('fullName').session(session);
+  const sponsorName = String(sponsor?.fullName || 'Your sponsor').trim();
 
   ownerWallet.balance = ownerPreviousBalance - amount;
   ownerWallet.totalWithdrawals = Number(ownerWallet.totalWithdrawals || 0) + amount;
@@ -187,14 +189,55 @@ const transferLinkedDependentAllocation = async (ownerWallet, dependent, session
     status: 'completed',
     paymentMethod: 'wallet',
     fundingSource: 'familySupport',
-    description: 'Received allocated funds from your sponsor',
+    description: `Received funds from ${sponsorName}`,
     reference: `${reference}-RECEIVED`,
-    metadata: { dependentId: dependent._id, senderUserId: ownerWallet.user, reference },
+    metadata: { dependentId: dependent._id, senderUserId: ownerWallet.user, senderName: sponsorName, reference },
     completedAt: new Date(),
   });
   await recipientTransaction.save({ session });
 
-  return { amount, dependentWallet, recipientTransaction };
+  return { amount, dependentWallet, recipientTransaction, sponsorName };
+};
+
+const notifyDependentWalletTransfer = async ({ dependent, transfer, ownerId }) => {
+  if (!transfer) return;
+
+  const amount = Number(transfer.amount || 0).toFixed(2);
+  const sponsorName = transfer.sponsorName || 'Your sponsor';
+  const notifications = [
+    {
+      userId: dependent.linkedUser,
+      type: 'wallet_funded',
+      title: 'Your health wallet was funded',
+      body: `${sponsorName} added $${amount} to your wallet. It is available to spend.`,
+      route: '/health-wallet',
+      data: {
+        transactionId: String(transfer.recipientTransaction?._id || ''),
+        amount,
+        senderName: sponsorName,
+      },
+    },
+    {
+      userId: ownerId,
+      type: 'wallet_funded',
+      title: 'Dependent wallet funded',
+      body: `$${amount} was sent to ${dependent.fullName}'s health wallet.`,
+      route: '/health-wallet',
+      data: {
+        transactionId: String(transfer.recipientTransaction?._id || ''),
+        amount,
+        dependentId: String(dependent._id),
+      },
+    },
+  ];
+
+  await Promise.all(notifications.map(async (notification) => {
+    try {
+      await notifyUser(notification);
+    } catch (error) {
+      console.warn('[wallet] push failed after dependent transfer:', error?.message || error);
+    }
+  }));
 };
 
 const linkDependentAndTransferAllocation = async ({ dependentId, ownerId, linkedUserId, linkedAccountEmail }) => {
@@ -1398,6 +1441,22 @@ router.post('/dependents/add', async (req, res) => {
       careAccessMode,
     });
 
+    if (linkedUser) {
+      const sponsor = await User.findById(userId).select('fullName');
+      try {
+        await notifyUser({
+          userId: linkedUser._id,
+          type: 'dependent_linked',
+          title: 'You were added to a family wallet',
+          body: `${sponsor?.fullName || 'A family member'} added you as a dependent. Funds sent to you will be available in your health wallet.`,
+          route: '/health-wallet',
+          data: { dependentId: String(dependent._id), sponsorId: String(userId) },
+        });
+      } catch (notifyError) {
+        console.warn('[wallet] push failed after dependent was linked:', notifyError?.message || notifyError);
+      }
+    }
+
     return res.status(201).json({
       success: true,
       message: 'Dependent added successfully',
@@ -1424,23 +1483,25 @@ router.get('/dependents', async (req, res) => {
     for (const pending of pendingDependents) {
       const linkedUser = await User.findOne({ email: pending.linkedAccountEmail }).select('_id');
       if (linkedUser) {
-        await linkDependentAndTransferAllocation({
+        const result = await linkDependentAndTransferAllocation({
           dependentId: pending._id,
           ownerId: userId,
           linkedUserId: linkedUser._id,
           linkedAccountEmail: pending.linkedAccountEmail,
         });
+        await notifyDependentWalletTransfer({ dependent: result?.dependent || pending, transfer: result?.transfer, ownerId: userId });
       }
     }
 
     const linkedOwnedDependents = await Dependent.find({ owner: userId, active: true, linkedUser: { $ne: null } });
     for (const dependent of linkedOwnedDependents) {
-      await linkDependentAndTransferAllocation({
+      const result = await linkDependentAndTransferAllocation({
         dependentId: dependent._id,
         ownerId: userId,
         linkedUserId: dependent.linkedUser,
         linkedAccountEmail: dependent.linkedAccountEmail,
       });
+      await notifyDependentWalletTransfer({ dependent: result?.dependent || dependent, transfer: result?.transfer, ownerId: userId });
     }
 
     const dependents = await Dependent.find({ owner: userId, active: true })
@@ -1461,11 +1522,19 @@ router.get('/dependents', async (req, res) => {
     const transferredByDependent = new Map(
       transferTotals.map((item) => [String(item._id), Number(item.totalTransferred || 0)])
     );
+    const linkedUserIds = dependents.map((dependent) => dependent.linkedUser?._id || dependent.linkedUser).filter(Boolean);
+    const linkedWallets = linkedUserIds.length
+      ? await Wallet.find({ user: { $in: linkedUserIds } }).select('user balance').lean()
+      : [];
+    const balanceByLinkedUser = new Map(
+      linkedWallets.map((wallet) => [String(wallet.user), Number(wallet.balance || 0)])
+    );
     return res.json({
       success: true,
       dependents: dependents.map((dependent) => ({
         ...dependent.toObject(),
         transferredAmount: transferredByDependent.get(String(dependent._id)) || 0,
+        dependentWalletBalance: balanceByLinkedUser.get(String(dependent.linkedUser?._id || dependent.linkedUser || '')) || 0,
       })),
     });
   } catch (error) {
@@ -1494,23 +1563,7 @@ router.get('/dependents/linked-to-me', async (req, res) => {
           linkedUserId: userId,
           linkedAccountEmail: normalizedEmail,
         });
-        if (result?.transfer) {
-          try {
-            await notifyUser({
-              userId,
-              type: 'wallet_funded',
-              title: 'Dependent wallet funded',
-              body: `${result.transfer.amount.toFixed(2)} in family funds is now available in your wallet.`,
-              route: '/health-wallet',
-              data: {
-                transactionId: String(result.transfer.recipientTransaction._id),
-                amount: String(result.transfer.amount),
-              },
-            });
-          } catch (notifyError) {
-            console.warn('[wallet] push failed after linked dependent allocation transfer:', notifyError?.message || notifyError);
-          }
-        }
+        await notifyDependentWalletTransfer({ dependent: result?.dependent || pending, transfer: result?.transfer, ownerId: pending.owner });
       }
     }
 
@@ -1520,12 +1573,13 @@ router.get('/dependents/linked-to-me', async (req, res) => {
 
     for (const dependent of linkedDependents) {
       const ownerId = String(dependent.owner?._id || dependent.owner || '');
-      await linkDependentAndTransferAllocation({
+      const result = await linkDependentAndTransferAllocation({
         dependentId: dependent._id,
         ownerId,
         linkedUserId: userId,
         linkedAccountEmail: dependent.linkedAccountEmail,
       });
+      await notifyDependentWalletTransfer({ dependent: result?.dependent || dependent, transfer: result?.transfer, ownerId });
     }
 
     const refreshedLinkedDependents = await Dependent.find({ linkedUser: userId, active: true })
@@ -1615,6 +1669,8 @@ router.post('/dependents/:id/allowance', async (req, res) => {
         }
 
         const dependentWallet = await ensureWallet(dependent.linkedUser, session);
+        const sponsor = await User.findById(userId).select('fullName').session(session);
+        const sponsorName = String(sponsor?.fullName || 'Your sponsor').trim();
         const ownerPreviousBalance = Number(wallet.balance || 0);
         const dependentPreviousBalance = Number(dependentWallet.balance || 0);
 
@@ -1658,9 +1714,9 @@ router.post('/dependents/:id/allowance', async (req, res) => {
           status: 'completed',
           paymentMethod: 'wallet',
           fundingSource: 'walletBalance',
-          description: `Received funds from ${ownerTransaction.user}`,
+          description: `Received funds from ${sponsorName}`,
           reference: `${reference}-RECEIVED`,
-          metadata: { dependentId: dependent._id, senderUserId: userId, reference },
+          metadata: { dependentId: dependent._id, senderUserId: userId, senderName: sponsorName, reference },
           completedAt: new Date(),
         });
         await recipientTransaction.save({ session });
@@ -1668,18 +1724,11 @@ router.post('/dependents/:id/allowance', async (req, res) => {
         await session.commitTransaction();
         session.endSession();
 
-        try {
-          await notifyUser({
-            userId: dependent.linkedUser,
-            type: 'wallet_funded',
-            title: 'Wallet funded by your sponsor',
-            body: `${ownerTransaction.amount.toFixed(2)} was added to your health wallet.`,
-            route: '/health-wallet',
-            data: { transactionId: String(recipientTransaction._id), amount: String(allowanceAmount) },
-          });
-        } catch (notifyError) {
-          console.warn('[wallet] push failed after dependent transfer:', notifyError?.message || notifyError);
-        }
+        await notifyDependentWalletTransfer({
+          dependent,
+          ownerId: userId,
+          transfer: { amount: allowanceAmount, recipientTransaction, sponsorName },
+        });
 
         return res.status(201).json({
           success: true,
@@ -1764,6 +1813,19 @@ router.post('/dependents/:id/allowance', async (req, res) => {
       const allocation = (wallet.dependentSupportAllocations || []).find(
         (entry) => String(entry.dependentId) === String(dependent._id) && entry.active
       );
+
+      try {
+        await notifyUser({
+          userId,
+          type: 'wallet_funded',
+          title: 'Dependent funds set aside',
+          body: `$${allowanceAmount.toFixed(2)} is reserved for ${dependent.fullName}. It will move to their wallet after they link their Qureo account.`,
+          route: '/health-wallet',
+          data: { dependentId: String(dependent._id), amount: allowanceAmount.toFixed(2) },
+        });
+      } catch (notifyError) {
+        console.warn('[wallet] push failed after dependent allowance was reserved:', notifyError?.message || notifyError);
+      }
 
       return res.status(201).json({
         success: true,

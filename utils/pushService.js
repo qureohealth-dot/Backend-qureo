@@ -218,7 +218,9 @@ async function sendPushToToken(token, title, body, data = {}) {
   if (!firebaseApp) {
     return {
       success: false,
-      reason: `Firebase Admin not initialized: ${pushInitStatus.reason || 'check Railway Firebase service account variables'}`,
+      reason: `Firebase Admin not initialized: ${
+        pushInitStatus.reason || 'check Railway Firebase service account variables'
+      }`,
     };
   }
 
@@ -229,63 +231,60 @@ async function sendPushToToken(token, title, body, data = {}) {
   try {
     const messaging = getMessaging(firebaseApp);
 
-    // Ensure route field is present for deep-linking
     const enrichedData = normalizeDataPayload({
       ...data,
-      route: data.route || '/notification', // fallback to notification page if no route specified
+      route: data.route || '/notification',
     });
 
-    // Determine if this notification should ring the device (consultation alerts)
-    const shouldRing = data.ring === true || (data.type && data.type.startsWith('consultation_'));
+    // Consultation notifications should use the high-priority
+    // Android notification channel configured in the app.
+    const shouldRing =
+      data.ring === true ||
+      (data.type && data.type.startsWith('consultation_'));
 
     const androidNotification = {
       channelId: 'qureo-alerts',
       clickAction: 'FLUTTER_NOTIFICATION_CLICK',
+      sound: shouldRing ? 'qureo_alarm' : 'default',
+      visibility: 'public',
     };
 
-    if (shouldRing) {
-      androidNotification.sound = 'qureo_alarm';
-      androidNotification.vibrate = [0, 500, 200, 500, 200, 1000];
-      androidNotification.lightSettings = { color: '#FF5722', lightOnDurationMillis: 500, lightOffDurationMillis: 500 };
-      androidNotification.visibility = 'public';
-      androidNotification.audioAttributes = {
-        usage: 2,
-        flags: 64,
-      };
-    } else {
-      androidNotification.sound = 'default';
-    }
+    const message = {
+      token,
 
-     // Build the message payload
-     const message = {
-       token,
-       notification: {
-         title,
-         body,
-       },
-       data: enrichedData,
-       android: {
-         ttl: 3600, // 1 hour
-         priority: 'high',
-         notification: androidNotification,
-       },
-       apns: {
-         payload: {
-           aps: {
-             sound: 'default',
-             alert: {
-               title,
-               body,
-             },
-             badge: 1,
-           },
-         },
-       },
-     };
+      notification: {
+        title,
+        body,
+      },
+
+      data: enrichedData,
+
+      android: {
+        ttl: 3600,
+        priority: 'high',
+        notification: androidNotification,
+      },
+
+      apns: {
+        payload: {
+          aps: {
+            sound: 'default',
+            alert: {
+              title,
+              body,
+            },
+            badge: 1,
+          },
+        },
+      },
+    };
 
     const messageId = await messaging.send(message);
 
-    console.log(`[Push Service] Message sent successfully (ID: ${messageId})`);
+    console.log(
+      `[Push Service] Message sent successfully (ID: ${messageId})`
+    );
+
     return {
       success: true,
       messageId,
@@ -293,7 +292,9 @@ async function sendPushToToken(token, title, body, data = {}) {
     };
   } catch (error) {
     const reason = error?.message || 'FCM send failed';
+
     console.error('[Push Service] Error sending message:', reason);
+
     return {
       success: false,
       reason,
@@ -337,15 +338,11 @@ async function sendPushToMultipleTokens(tokens, title, body, data = {}) {
       clickAction: 'FLUTTER_NOTIFICATION_CLICK',
     };
 
-    if (shouldRing) {
-      androidNotification.sound = 'qureo_alarm';
-      androidNotification.vibrate = [0, 500, 200, 500, 200, 1000];
-      androidNotification.lightSettings = { color: '#FF5722', lightOnDurationMillis: 500, lightOffDurationMillis: 500 };
-      androidNotification.visibility = 'public';
-      androidNotification.audioAttributes = { usage: 2, flags: 64 };
-    } else {
-      androidNotification.sound = 'default';
-    }
+androidNotification.sound = shouldRing
+  ? 'qureo_alarm'
+  : 'default';
+
+androidNotification.visibility = 'public';
 
      const message = {
        notification: {

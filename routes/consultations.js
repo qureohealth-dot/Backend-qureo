@@ -2,6 +2,7 @@ const express = require("express");
 const { v4: uuidv4 } = require("uuid");
 const mongoose = require("mongoose");
 const Consultation = require("../models/Consultations");
+const NotificationEvent = require("../models/NotificationEvent");
 const Doctor = require("../models/Doctor");
 const Profile = require("../models/Profile");
 const Prescription = require("../models/Prescription");
@@ -523,6 +524,38 @@ router.get('/chat-sessions', auth, async (req, res) => {
     });
   }
 });
+
+router.get('/chat-unread-count', auth, async (req, res) => {
+  try {
+    const unreadCount = await NotificationEvent.countDocuments({
+      userId: req.userId,
+      type: 'consultation_message',
+      read: false,
+    });
+    return res.json({ unreadCount });
+  } catch (err) {
+    return res.status(500).json({ message: 'Failed to load unread chat count.' });
+  }
+});
+
+router.post('/chat-notifications/read', auth, async (req, res) => {
+  try {
+    const filter = {
+      userId: req.userId,
+      type: 'consultation_message',
+      read: false,
+    };
+    if (req.body?.consultationId) {
+      filter['data.consultationId'] = String(req.body.consultationId);
+    }
+
+    const result = await NotificationEvent.updateMany(filter, { $set: { read: true } });
+    return res.json({ updatedCount: result.modifiedCount || 0 });
+  } catch (err) {
+    return res.status(500).json({ message: 'Failed to mark chat notifications as read.' });
+  }
+});
+
 router.post('/room/:roomId/save-chat', auth, async (req, res) => {
   try {
     const consultation = await Consultation.findOne({ roomId: req.params.roomId });
@@ -700,6 +733,42 @@ router.post('/:id/chat', auth, async (req, res) => {
     };
 
     await Consultation.findByIdAndUpdate(req.params.id, { $push: { chat: message }, updatedAt: new Date() });
+
+    if (resolvedSenderRole === 'doctor') {
+      const preview = normalizedText || 'Sent you an attachment';
+      const body = `${message.senderName}: ${preview.slice(0, 140)}`;
+      const notificationData = {
+        consultationId: String(consultation._id),
+        roomId: consultation.roomId,
+        route: `/consultation-chats/${consultation._id}`,
+      };
+
+      try {
+        await NotificationEvent.create({
+          userId: consultation.patient,
+          type: 'consultation_message',
+          title: 'New message from your doctor',
+          body,
+          icon: '💬',
+          data: notificationData,
+        });
+      } catch (notificationError) {
+        console.error('[consultation-chat] Failed to save patient message notification:', notificationError);
+      }
+
+      try {
+        await notifyUser({
+          userId: consultation.patient,
+          type: 'consultation_message',
+          title: 'New message from your doctor',
+          body,
+          route: notificationData.route,
+          data: notificationData,
+        });
+      } catch (notificationError) {
+        console.error('[consultation-chat] Failed to push patient message notification:', notificationError);
+      }
+    }
 
     return res.status(201).json({ message });
   } catch (err) {

@@ -66,6 +66,7 @@ const NOTIFICATION_TYPE_MAP = {
   in_person_confirmed: { category: 'doctor_consultations' },
   consultation_summary: { category: 'doctor_consultations' },
   consultation_notes: { category: 'doctor_consultations' },
+  consultation_message: { category: 'doctor_consultations' },
 
   pharmacy_prescription_approved: { category: 'pharmacy' },
   pharmacy_medicine_ready: { category: 'pharmacy' },
@@ -93,6 +94,7 @@ const NOTIFICATION_TYPE_MAP = {
   wallet_payment_completed: { category: 'health_wallet' },
   lab_result_status_updated: { category: 'lab_services' },
   wallet_funded: { category: 'health_wallet' },
+  dependent_linked: { category: 'health_wallet' },
   wallet_low_balance: { category: 'health_wallet' },
   wallet_cashback: { category: 'health_wallet' },
   wallet_reward: { category: 'health_wallet' },
