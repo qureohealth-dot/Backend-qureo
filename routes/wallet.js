@@ -13,8 +13,10 @@ const Pharmacy = require('../models/Pharmacy');
 const Dependent = require('../models/Dependent');
 const DonorVoucher = require('../models/DonorVoucher');
 const { notifyUser } = require('../utils/notifyUser');
+const auth = require('../middleware/auth');
 const { randomUUID } = require('crypto');
 const { createCollection, getCollectionStatus } = require('../services/dollr');
+const { createRequestToPay, getRequestToPayStatus } = require('../services/mtnMobileMoney');
 
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -927,98 +929,25 @@ router.post('/transactions/:id', async (req, res) => {
 });
 
 // Add funds from explicit healthcare funding sources
-router.post('/funding-source/add', async (req, res) => {
+router.post('/funding-source/add', auth, async (req, res) => {
+  let fundingReferenceId = null;
   try {
-    const { userId, amount, sourceType = 'wallet_balance', sourceLabel = '', sourceContext = {} } = req.body;
-    if (!userId) return res.status(400).json({ error: 'userId is required' });
+    const { amount, sourceType = 'wallet_balance', sourceLabel = '', sourceContext = {} } = req.body;
+    const userId = req.userId;
+    if (!userId) return res.status(401).json({ error: 'Authentication is required' });
     if (!amount || Number(amount) <= 0) return res.status(400).json({ error: 'Invalid amount' });
 
     const normalizedSource = String(sourceType).toLowerCase();
-
-router.get('/funding-source/status/:referenceId', async (req, res) => {
-  const { referenceId } = req.params;
-  const { userId } = req.query;
-  if (!referenceId || !userId) {
-    return res.status(400).json({ error: 'referenceId and userId are required' });
-  }
-
-  try {
-    const transaction = await Transaction.findOne({ dollrReferenceId: referenceId, user: userId });
-    if (!transaction) return res.status(404).json({ error: 'Funding transaction not found' });
-
-    const dollrResponse = await getCollectionStatus(referenceId);
-    const dollrStatus = String(
-      dollrResponse?.status || dollrResponse?.data?.status || 'PROCESSING'
-    ).toUpperCase();
-
-    if (dollrStatus === 'COMPLETED' && transaction.status !== 'completed') {
-      const session = await mongoose.startSession();
-      try {
-        session.startTransaction();
-        const lockedTransaction = await Transaction.findOne({
-          _id: transaction._id,
-          status: { $ne: 'completed' },
-        }).session(session);
-        if (lockedTransaction) {
-          const wallet = await ensureWallet(userId, session);
-          const fundingAmount = Number(lockedTransaction.amount);
-          const previousBalance = Number(wallet.balance || 0);
-          wallet.balance = previousBalance + fundingAmount;
-          wallet.totalDeposits = Number(wallet.totalDeposits || 0) + fundingAmount;
-          wallet.lastTransaction = new Date();
-          wallet.reservedFunds.mobileMoney = Number(wallet.reservedFunds?.mobileMoney || 0) + fundingAmount;
-          await wallet.save({ session });
-
-          lockedTransaction.previousBalance = previousBalance;
-          lockedTransaction.newBalance = wallet.balance;
-          lockedTransaction.status = 'completed';
-          lockedTransaction.dollrStatus = dollrStatus;
-          lockedTransaction.completedAt = new Date();
-          await lockedTransaction.save({ session });
-        }
-        await session.commitTransaction();
-      } catch (error) {
-        await session.abortTransaction();
-        throw error;
-      } finally {
-        session.endSession();
-      }
-    } else if (dollrStatus === 'FAILED' || dollrStatus === 'CANCELED' || dollrStatus === 'CANCELLED') {
-      await Transaction.updateOne(
-        { _id: transaction._id, status: { $ne: 'completed' } },
-        { $set: { status: 'failed', dollrStatus } }
-      );
-    } else if (transaction.dollrStatus !== dollrStatus) {
-      await Transaction.updateOne({ _id: transaction._id }, { $set: { dollrStatus } });
-    }
-
-    const current = await Transaction.findById(transaction._id).select('status dollrStatus amount newBalance');
-    return res.json({
-      success: true,
-      status: current.dollrStatus || dollrStatus,
-      transactionStatus: current.status,
-      amount: current.amount,
-      walletBalance: current.newBalance,
-    });
-  } catch (error) {
-    return res.status(502).json({ error: error.message });
-  }
-});
     const bucketKey = SOURCE_TO_BUCKET[normalizedSource];
     if (!bucketKey) {
       return res.status(400).json({ error: 'Unsupported sourceType' });
     }
 
     if (normalizedSource === 'mobile_money') {
-      const sourcePhone = String(sourceContext?.phoneNumber || '').replace(/\s+/g, '');
+      const sourcePhone = String(sourceContext?.phoneNumber || '').replace(/\D/g, '');
       const network = String(sourceContext?.network || '').toUpperCase();
-      const providerMap = {
-        MTN: { provider: process.env.DOLLR_MOBILE_MONEY_PROVIDER || 'PAWAPAY', method: process.env.DOLLR_MTN_METHOD || 'MTN_MOMO_LBR', countryCode: process.env.DOLLR_COUNTRY_CODE || 'LR' },
-        ORANGE: { provider: process.env.DOLLR_MOBILE_MONEY_PROVIDER || 'PAWAPAY', method: process.env.DOLLR_ORANGE_METHOD || 'ORANGE_MONEY_LBR', countryCode: process.env.DOLLR_COUNTRY_CODE || 'LR' },
-      };
-      const networkConfig = providerMap[network];
-      if (!sourcePhone || !networkConfig) {
-        return res.status(400).json({ error: 'A valid mobile number and supported network are required' });
+      if (!sourcePhone || !/^[1-9]\d{7,14}$/.test(sourcePhone) || network !== 'MTN') {
+        return res.status(400).json({ error: 'Enter a valid international phone number and select MTN' });
       }
 
       const user = await User.findById(userId).select('fullName email');
@@ -1026,6 +955,7 @@ router.get('/funding-source/status/:referenceId', async (req, res) => {
 
       const wallet = await ensureWallet(userId);
       const referenceId = randomUUID();
+      fundingReferenceId = referenceId;
       const fundingAmount = Number(amount);
       const transaction = await Transaction.create({
         wallet: wallet._id,
@@ -1038,38 +968,33 @@ router.get('/funding-source/status/:referenceId', async (req, res) => {
         paymentMethod: 'mobile_money',
         fundingSource: bucketKey,
         reference: referenceId,
-        dollrReferenceId: referenceId,
+        mobileMoneyReferenceId: referenceId,
+        mobileMoneyProvider: 'MTN',
+        mobileMoneyStatus: 'PENDING',
         metadata: { sourceType: normalizedSource, sourceLabel, sourceContext },
       });
 
       try {
-        const collection = await createCollection({
-          fullName: user.fullName || user.email,
-          email: user.email,
-          phone: sourcePhone,
-          countryCode: networkConfig.countryCode,
+        await createRequestToPay({
           amount: fundingAmount,
-          currency: wallet.currency || process.env.DOLLR_CURRENCY || 'USD',
-          provider: networkConfig.provider,
-          method: networkConfig.method,
+          currency: process.env.MTN_MOMO_CURRENCY || wallet.currency || 'USD',
+          phone: sourcePhone,
           referenceId,
         });
-        transaction.dollrSourceId = collection.invoiceId;
-        transaction.dollrStatus = collection.execution?.status || 'PENDING';
-        transaction.metadata = { ...transaction.metadata, dollr: collection };
         await transaction.save();
         return res.status(202).json({
           success: true,
-          message: 'Mobile-money collection initiated. Approve it on your phone.',
-          status: transaction.dollrStatus,
+          message: 'MTN MoMo payment request sent. Approve it on your phone.',
+          status: transaction.mobileMoneyStatus,
           referenceId,
           transactionId: transaction._id,
         });
       } catch (error) {
         transaction.status = 'failed';
-        transaction.dollrStatus = 'FAILED';
+        transaction.mobileMoneyStatus = 'FAILED';
         transaction.metadata = { ...transaction.metadata, error: error.message };
         await transaction.save();
+        console.error(`[wallet] MTN MoMo request-to-pay failed (reference=${referenceId}): ${error.message}`);
         throw error;
       }
     }
@@ -1251,7 +1176,105 @@ router.get('/funding-source/status/:referenceId', async (req, res) => {
       throw error;
     }
   } catch (error) {
+    const sourceType = String(req.body?.sourceType || 'wallet_balance').toLowerCase();
+    console.error(`[wallet] funding-source/add failed (sourceType=${sourceType}${fundingReferenceId ? `, reference=${fundingReferenceId}` : ''}): ${error.message}`);
     return res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/funding-source/status/:referenceId', auth, async (req, res) => {
+  const { referenceId } = req.params;
+  const userId = req.userId;
+  if (!referenceId || !userId) {
+    return res.status(401).json({ error: 'Authentication and referenceId are required' });
+  }
+
+  try {
+    const transaction = await Transaction.findOne({
+      user: userId,
+      $or: [
+        { mobileMoneyReferenceId: referenceId },
+        { dollrReferenceId: referenceId },
+      ],
+    });
+    if (!transaction) return res.status(404).json({ error: 'Funding transaction not found' });
+
+    const isMtn = transaction.mobileMoneyProvider === 'MTN';
+    const providerResponse = isMtn
+      ? await getRequestToPayStatus(referenceId)
+      : await getCollectionStatus(referenceId);
+    const rawStatus = providerResponse?.status || providerResponse?.data?.status || 'PROCESSING';
+    const providerStatus = String(rawStatus).toUpperCase();
+    const statusField = isMtn ? 'mobileMoneyStatus' : 'dollrStatus';
+    const isCompleted = ['COMPLETED', 'SUCCESS', 'SUCCESSFUL', 'SUCCEEDED'].includes(providerStatus);
+    const isFailed = ['FAILED', 'CANCELED', 'CANCELLED', 'REJECTED', 'EXPIRED'].includes(providerStatus);
+
+    if (isCompleted && transaction.status !== 'completed') {
+      const session = await mongoose.startSession();
+      try {
+        session.startTransaction();
+        const lockedTransaction = await Transaction.findOne({
+          _id: transaction._id,
+          status: { $ne: 'completed' },
+        }).session(session);
+        if (lockedTransaction) {
+          const wallet = await ensureWallet(userId, session);
+          const fundingAmount = Number(lockedTransaction.amount);
+          const previousBalance = Number(wallet.balance || 0);
+          wallet.balance = previousBalance + fundingAmount;
+          wallet.totalDeposits = Number(wallet.totalDeposits || 0) + fundingAmount;
+          wallet.lastTransaction = new Date();
+          wallet.reservedFunds.mobileMoney = Number(wallet.reservedFunds?.mobileMoney || 0) + fundingAmount;
+          await wallet.save({ session });
+
+          lockedTransaction.previousBalance = previousBalance;
+          lockedTransaction.newBalance = wallet.balance;
+          lockedTransaction.status = 'completed';
+          lockedTransaction[statusField] = providerStatus;
+          lockedTransaction.completedAt = new Date();
+          await lockedTransaction.save({ session });
+        }
+        await session.commitTransaction();
+      } catch (error) {
+        await session.abortTransaction();
+        throw error;
+      } finally {
+        session.endSession();
+      }
+
+      if (transaction.status !== 'completed') {
+        try {
+          await notifyUser({
+            userId,
+            type: 'wallet_funded',
+            title: 'Mobile money payment confirmed',
+            body: `$${Number(transaction.amount).toFixed(2)} was added to your health wallet.`,
+            route: '/health-wallet',
+            data: { transactionId: String(transaction._id), amount: String(transaction.amount) },
+          });
+        } catch (notifyError) {
+          console.warn('[wallet] push failed after mobile-money collection completed:', notifyError?.message || notifyError);
+        }
+      }
+    } else if (isFailed && transaction.status !== 'completed') {
+      await Transaction.updateOne(
+        { _id: transaction._id, status: { $ne: 'completed' } },
+        { $set: { status: 'failed', [statusField]: providerStatus } }
+      );
+    } else if (transaction[statusField] !== providerStatus) {
+      await Transaction.updateOne({ _id: transaction._id }, { $set: { [statusField]: providerStatus } });
+    }
+
+    const current = await Transaction.findById(transaction._id).select('status dollrStatus mobileMoneyStatus amount newBalance');
+    return res.json({
+      success: true,
+      status: current[statusField] || providerStatus,
+      transactionStatus: current.status,
+      amount: current.amount,
+      walletBalance: current.newBalance,
+    });
+  } catch (error) {
+    return res.status(502).json({ error: error.message });
   }
 });
 

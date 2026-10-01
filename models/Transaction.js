@@ -18,6 +18,9 @@ const transactionSchema = new mongoose.Schema({
   dollrReferenceId: { type: String, unique: true, sparse: true },
   dollrSourceId: { type: String, default: null },
   dollrStatus: { type: String, default: null },
+  mobileMoneyReferenceId: { type: String, unique: true, sparse: true },
+  mobileMoneyProvider: { type: String, default: null },
+  mobileMoneyStatus: { type: String, default: null },
 
   status: { 
     type: String, 

@@ -46,8 +46,49 @@ const call = async (method, path, data, params) => {
     });
     return response.data;
   } catch (error) {
-    const detail = error.response?.data?.detail || error.response?.data?.message;
-    throw new Error(detail || `Dollr request failed with status ${error.response?.status || 'unknown'}`);
+    const status = error.response?.status || 'unknown';
+    const responseData = error.response?.data;
+
+    console.error(`[Dollr] ${method} ${path} failed`);
+    console.error(`[Dollr] HTTP status: ${status}`);
+    console.error(
+      '[Dollr] Response:',
+      JSON.stringify(responseData, null, 2)
+    );
+
+    if (Array.isArray(responseData?.detail)) {
+      console.error('[Dollr] Validation details:');
+
+      for (const item of responseData.detail) {
+        console.error(
+          `  Field: ${item.loc?.join('.') || 'unknown'}`
+        );
+        console.error(
+          `  Message: ${item.msg || 'unknown'}`
+        );
+        console.error(
+          `  Type: ${item.type || 'unknown'}`
+        );
+      }
+    }
+
+    const message = Array.isArray(responseData?.detail)
+      ? responseData.detail
+          .map((item) => {
+            const field = item.loc?.slice(1).join('.') || 'unknown';
+            return `${field}: ${item.msg}`;
+          })
+          .join('; ')
+      : responseData?.message ||
+        error.message ||
+        `Dollr request failed with status ${status}`;
+
+    const contextualError = new Error(
+      `Dollr ${method} ${path} failed (HTTP ${status}): ${message}`
+    );
+
+    contextualError.cause = error;
+    throw contextualError;
   }
 };
 
