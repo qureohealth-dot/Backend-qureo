@@ -475,7 +475,9 @@ router.get("/transaction-wallet/:providerId", async (req, res) => {
       return res.status(400).json({ error: "Provider ID is required" });
     }
 
-    const transactions = await Transaction.find({ provider: providerId })
+    const transactions = await Transaction.find({
+      $or: [{ provider: providerId }, { user: providerId }]
+    })
       .sort({ createdAt: -1 }) // newest first
       .populate("user", "name email") // optional
       .populate("provider", "email type"); // optional

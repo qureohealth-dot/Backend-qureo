@@ -9,6 +9,7 @@ const providerSchema = new mongoose.Schema(
     phone: String,
     address: String,
     logo: String, // optional Cloudinary image
+    providerType: { type: String, default: null },
     verified: { type: Boolean, default: false },
   },
   { timestamps: true }

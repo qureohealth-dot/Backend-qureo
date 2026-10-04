@@ -4,14 +4,18 @@ const Provider = require("../models/Provider");
 const Pharmacy = require("../models/Pharmacy");
 const HealthcareProvider = require("../models/HealthcareProvider");
 const LabTest = require("../models/LabTest");
+const Wallet = require("../models/Wallet");
+const Transaction = require("../models/Transaction");
+const mongoose = require("mongoose");
 const jwt = require("jsonwebtoken");
+const labProviderAuth = require("../middleware/labProviderAuth");
 
 const JWT_SECRET = process.env.JWT_SECRET || "supersecret123";
 
 // REGISTER new provider
 router.post("/register", async (req, res) => {
   try {
-    const { name, email, password, phone, address, logo } = req.body;
+    const { name, email, password, phone, address, logo, providerType } = req.body;
 
     const existing = await Provider.findOne({ email });
     if (existing)
@@ -24,7 +28,14 @@ router.post("/register", async (req, res) => {
       phone,
       address,
       logo,
+      providerType: providerType || null,
     });
+
+    await Wallet.findOneAndUpdate(
+      { user: provider._id },
+      { $setOnInsert: { balance: 0, currency: "USD", status: "active" } },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
 
     const token = jwt.sign({ id: provider._id }, JWT_SECRET, { expiresIn: "7d" });
 
@@ -36,6 +47,7 @@ router.post("/register", async (req, res) => {
         id: provider._id,
         name: provider.name,
         email: provider.email,
+        providerType: provider.providerType,
       },
     });
   } catch (err) {
@@ -68,6 +80,7 @@ router.post("/login", async (req, res) => {
         id: provider._id,
         name: provider.name,
         email: provider.email,
+        providerType: provider.providerType,
       },
     });
   } catch (err) {
@@ -76,6 +89,87 @@ router.post("/login", async (req, res) => {
       error: "Failed to login provider",
       details: err.message,
     });
+  }
+});
+
+router.get("/me/wallet", labProviderAuth, async (req, res) => {
+  try {
+    const wallet = await Wallet.findOneAndUpdate(
+      { user: req.labProvider._id },
+      { $setOnInsert: { balance: 0, currency: "USD", status: "active" } },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    res.json({
+      success: true,
+      wallet: {
+        balance: wallet.balance,
+        currency: wallet.currency,
+        status: wallet.status,
+        totalDeposits: wallet.totalDeposits,
+        totalWithdrawals: wallet.totalWithdrawals,
+        lastTransaction: wallet.lastTransaction,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch lab provider wallet" });
+  }
+});
+
+router.post("/me/wallet/withdraw", labProviderAuth, async (req, res) => {
+  const amount = Number(req.body?.amount);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return res.status(400).json({ success: false, message: "Enter a valid withdrawal amount" });
+  }
+
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  try {
+    const wallet = await Wallet.findOne({ user: req.labProvider._id }).session(session);
+    if (!wallet) {
+      await session.abortTransaction();
+      return res.status(404).json({ success: false, message: "Wallet not found" });
+    }
+    if (Number(wallet.balance || 0) < amount) {
+      await session.abortTransaction();
+      return res.status(400).json({ success: false, message: "Insufficient wallet balance" });
+    }
+
+    const previousBalance = Number(wallet.balance || 0);
+    const newBalance = previousBalance - amount;
+    wallet.balance = newBalance;
+    wallet.totalWithdrawals = Number(wallet.totalWithdrawals || 0) + amount;
+    wallet.lastTransaction = new Date();
+    await wallet.save({ session });
+
+    const transaction = new Transaction({
+      wallet: wallet._id,
+      user: req.labProvider._id,
+      type: "withdrawal",
+      amount,
+      previousBalance,
+      newBalance,
+      status: "pending",
+      paymentMethod: "bank_transfer",
+      description: `Withdrawal of $${amount.toFixed(2)}`,
+      reference: `LAB-WITH-${Date.now()}`,
+    });
+    await transaction.save({ session });
+    await session.commitTransaction();
+
+    return res.json({
+      success: true,
+      message: "Withdrawal initiated",
+      newBalance,
+      transactionId: transaction._id,
+      estimatedCompletion: "24 hours",
+    });
+  } catch (err) {
+    await session.abortTransaction();
+    console.error("Lab provider withdrawal error:", err);
+    return res.status(500).json({ success: false, message: "Failed to initiate withdrawal" });
+  } finally {
+    await session.endSession();
   }
 });
 

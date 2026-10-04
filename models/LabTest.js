@@ -15,6 +15,7 @@ const labTestSchema = new mongoose.Schema({
   price: { type: Number, required: true },
   image: String,
   laboratory: String,
+  provider: { type: mongoose.Schema.Types.ObjectId, ref: "Provider", default: null, index: true },
   ratings: { type: Number, default: 0 },
   reviews: [reviewSchema],
   preparation: String,

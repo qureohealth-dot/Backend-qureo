@@ -1,9 +1,10 @@
 const express = require("express");
 const router = express.Router();
 const LabTest = require("../models/LabTest"); // make sure path is correct
+const labProviderAuth = require("../middleware/labProviderAuth");
 
 // CREATE a new lab test
-router.post("/", async (req, res) => {
+router.post("/", labProviderAuth, async (req, res) => {
   try {
     const {
       name,
@@ -29,7 +30,8 @@ router.post("/", async (req, res) => {
       description,
       price,
       image,
-      laboratory,
+      laboratory: req.labProvider.name,
+      provider: req.labProvider._id,
       ratings: ratings || 0,
       reviews: reviews || [],
       preparation,
@@ -45,6 +47,16 @@ router.post("/", async (req, res) => {
   }
 });
 
+// List only the signed-in lab provider's products.
+router.get("/mine", labProviderAuth, async (req, res) => {
+  try {
+    const tests = await LabTest.find({ provider: req.labProvider._id }).sort({ createdAt: -1 });
+    res.json({ success: true, tests });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch provider lab tests" });
+  }
+});
+
 // GET all lab tests
 router.get("/", async (req, res) => {
   try {
@@ -56,8 +68,8 @@ router.get("/", async (req, res) => {
   }
 });
 
-// GET a single lab test by ID
-router.get("/:id", async (req, res) => {
+// GET a single lab test by ObjectId; named routes such as /mine never match here.
+router.get("/:id([0-9a-fA-F]{24})", async (req, res) => {
   try {
     const { id } = req.params;
     const test = await LabTest.findById(id).populate("reviews.user", "fullName name");
@@ -105,10 +117,12 @@ router.post("/:id/reviews", async (req, res) => {
 });
 
 // DELETE a lab test by ID
-router.delete("/:id", async (req, res) => {
+router.delete("/:id", labProviderAuth, async (req, res) => {
   try {
-    const { id } = req.params;
-    const deletedTest = await LabTest.findByIdAndDelete(id);
+    const deletedTest = await LabTest.findOneAndDelete({
+      _id: req.params.id,
+      provider: req.labProvider._id,
+    });
     if (!deletedTest) {
       return res.status(404).json({ error: "Lab test not found" });
     }

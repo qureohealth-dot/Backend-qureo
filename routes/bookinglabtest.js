@@ -3,6 +3,7 @@ const express = require("express");
 const Booking = require("../models/BookingLabtest.js");
 const LabTest = require("../models/LabTest.js");
 const { notifyUser } = require('../utils/notifyUser');
+const labProviderAuth = require("../middleware/labProviderAuth");
 const router = express.Router();
 
 
@@ -95,6 +96,29 @@ router.get("/user/:userId", async (req, res) => {
   }
 });
 
+router.get("/provider/mine", labProviderAuth, async (req, res) => {
+  try {
+    const providerTests = await LabTest.find({ provider: req.labProvider._id }).select("_id");
+    if (providerTests.length === 0) return res.json({ success: true, bookings: [] });
+
+    const bookings = await Booking.find({ "tests.testId": { $in: providerTests.map((test) => test._id) } })
+      .populate("user", "email fullName")
+      .populate("assignedAttendant")
+      .populate("tests.testId");
+    const providerTestIds = new Set(providerTests.map((test) => String(test._id)));
+    const providerBookings = bookings.map((booking) => {
+      booking.tests = booking.tests.filter((test) => {
+        const testId = test.testId?._id || test.testId;
+        return providerTestIds.has(String(testId));
+      });
+      return booking;
+    });
+    res.json({ success: true, bookings: providerBookings });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Failed to fetch provider bookings" });
+  }
+});
+
 
 // 🧾 ADMIN: Get all bookings
 router.get("/", async (req, res) => {
@@ -111,14 +135,22 @@ router.get("/", async (req, res) => {
 
 
 // 🧬 ADMIN: Update booking status
-router.put("/:id/status", async (req, res) => {
+router.put("/:id/status", labProviderAuth, async (req, res) => {
   try {
     const { status } = req.body;
-    const booking = await Booking.findByIdAndUpdate(
-      req.params.id,
-      { status },
-      { new: true }
-    );
+    const allowedStatuses = ["pending", "sample_collected", "in_progress", "completed", "cancelled"];
+    if (!allowedStatuses.includes(status)) {
+      return res.status(400).json({ success: false, message: "Invalid booking status" });
+    }
+
+    const providerTestIds = await LabTest.find({ provider: req.labProvider._id }).distinct("_id");
+    const booking = await Booking.findOne({
+      _id: req.params.id,
+      "tests.testId": { $in: providerTestIds },
+    });
+    if (!booking) return res.status(404).json({ success: false, message: "Order not found" });
+    booking.status = status;
+    await booking.save();
 
     // Non-blocking push to booking owner on status update
     try {
@@ -175,7 +207,7 @@ router.put("/:bookingId/test/:testId/specimen", async (req, res) => {
 
 
 // 📄 ADMIN: Upload result for a test
-router.put("/:bookingId/test/:testId/result", async (req, res) => {
+router.put("/:bookingId/test/:testId/result", labProviderAuth, async (req, res) => {
   const { bookingId, testId } = req.params;
   const { resultFile, remarks, status } = req.body.result; // resultFile = Cloudinary URL
   console.log(req.body);
@@ -185,12 +217,15 @@ router.put("/:bookingId/test/:testId/result", async (req, res) => {
 
     const test = booking.tests.id(testId); // Mongoose subdocument helper
     if (!test) return res.status(404).json({ message: "Test not found in booking" });
+    const ownedTest = await LabTest.exists({ _id: test.testId, provider: req.labProvider._id });
+    if (!ownedTest) return res.status(403).json({ message: "You can only update results for your lab products" });
 
     // Update test result
     test.result = {
       resultFile,          // Cloudinary URL
       remarks: remarks || "",
       status: status || "completed",
+      uploadedBy: req.labProvider._id,
       uploadedAt: new Date(),
       releasedAt: new Date(),
     };
