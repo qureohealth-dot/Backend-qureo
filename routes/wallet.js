@@ -780,7 +780,7 @@ router.post('/withdraw', async (req, res) => {
 // Pay provider
 router.post('/pay-provider', auth, async (req, res) => {
   try {
-    const { providerId, pharmacyId, amount, serviceDetails, type, dependentId = null, deliveryInfo } = req.body;
+    const { providerId, pharmacyId, amount, serviceDetails, type, dependentId = null, deliveryInfo, consultationBookingReference } = req.body;
     const userId = req.userId;
 
     if (!userId) return res.status(401).json({ error: 'Authentication required' });
@@ -920,6 +920,7 @@ router.post('/pay-provider', auth, async (req, res) => {
         reference: `PAY-${Date.now()}`,
         metadata: {
           serviceDetails,
+          ...(consultationBookingReference ? { consultationBookingReference: String(consultationBookingReference) } : {}),
           ...(pharmacy ? {
             pharmacyId: String(pharmacy._id),
             pharmacySubtotal,

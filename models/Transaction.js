@@ -29,6 +29,8 @@ const transactionSchema = new mongoose.Schema({
   },
   description: String,
   reference: { type: String, unique: true },
+  refundOf: { type: mongoose.Schema.Types.ObjectId, ref: 'Transaction', unique: true, sparse: true },
+  earningFor: { type: mongoose.Schema.Types.ObjectId, ref: 'Consultation', unique: true, sparse: true },
   paymentMethod: { type: String, default: 'wallet' },
   serviceCategory: { type: String, default: 'other' },
   fundingSource: { type: String, default: 'walletBalance' },

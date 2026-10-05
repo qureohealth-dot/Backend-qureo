@@ -1,7 +1,10 @@
 const express = require("express");
 const { v4: uuidv4 } = require("uuid");
 const mongoose = require("mongoose");
+const jwt = require('jsonwebtoken');
 const Consultation = require("../models/Consultations");
+const Transaction = require("../models/Transaction");
+const Wallet = require("../models/Wallet");
 const NotificationEvent = require("../models/NotificationEvent");
 const Doctor = require("../models/Doctor");
 const Profile = require("../models/Profile");
@@ -12,6 +15,22 @@ const moment = require("moment-timezone");
 const sendEmail = require("../utils/email");
 const sendSMS = require("../utils/sms");
 const { notifyUser } = require("../utils/notifyUser");
+
+const JWT_SECRET =
+  process.env.JWT_SECRET ||
+  process.env.AUTH_SECRET ||
+  (process.env.NODE_ENV === 'production' ? '' : 'qureo-local-dev-auth-secret');
+
+const consultationActorAuth = (req, res, next) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    return payload?.role === 'doctor' ? doctorAuth(req, res, next) : auth(req, res, next);
+  } catch (err) {
+    return res.status(401).json({ message: 'Authentication required' });
+  }
+};
 
 const STATUS_ACTIVE_FOR_CONFLICT = ["scheduled", "ongoing", "pending", "confirmed"];
 const STATUS_ACTIVE_FOR_REMINDERS = ["scheduled", "ongoing", "confirmed"];
@@ -298,6 +317,8 @@ const resolveDurationMinutes = (duration, durationMinutes) => {
         doctor_,
         duration,
         durationMinutes,
+        bookingPaymentReference,
+        amount,
         inPersonDetails = {},
         clinicDetails = {},
       } = req.body;
@@ -317,7 +338,21 @@ const resolveDurationMinutes = (duration, durationMinutes) => {
         return res.status(404).json({ message: "Doctor not found" });
       }
 
-      if (isInPerson && !isSlotAvailableFromDoctorSchedule(doctorDoc, appointmentTime)) {
+      let paymentTransaction = null;
+      if (bookingPaymentReference) {
+        paymentTransaction = await Transaction.findOne({
+          user: patient,
+          type: "consultation",
+          status: "completed",
+          "metadata.consultationBookingReference": String(bookingPaymentReference),
+        }).sort({ createdAt: -1 });
+        if (!paymentTransaction || Number(paymentTransaction.amount) !== Number(amount)) {
+          return res.status(400).json({ message: "A matching completed consultation payment is required" });
+        }
+      }
+
+      const hasDoctorSchedule = Object.values(doctorDoc.availability || {}).some((slots) => Array.isArray(slots) && slots.length > 0);
+      if ((isInPerson || hasDoctorSchedule) && !isSlotAvailableFromDoctorSchedule(doctorDoc, appointmentTime)) {
         return res.status(400).json({ message: "Selected slot is outside doctor availability" });
       }
 
@@ -331,7 +366,6 @@ const resolveDurationMinutes = (duration, durationMinutes) => {
         return res.status(409).json({ message: "Selected slot is already booked" });
       }
 
-      const createdStatus = isInPerson ? "pending" : "scheduled";
       const resolvedConsultationType = isInPerson ? "in-person" : "online";
 
       const consultation = await Consultation.create({
@@ -343,7 +377,10 @@ const resolveDurationMinutes = (duration, durationMinutes) => {
         durationMinutes: resolvedDurationMinutes,
         reason,
         roomId,
-        status: createdStatus,
+        status: "pending",
+        paymentTransaction: paymentTransaction?._id || null,
+        paidAmount: paymentTransaction ? Number(paymentTransaction.amount) : 0,
+        bookingPaymentReference: bookingPaymentReference ? String(bookingPaymentReference) : null,
         patientEmail,
         patient_,
         doctor_,
@@ -360,44 +397,34 @@ const resolveDurationMinutes = (duration, durationMinutes) => {
         },
       });
 
-      if (isInPerson) {
-        const doctorMessage = `New clinic visit request from ${consultation.patientName || "a patient"} for ${new Date(consultation.appointmentTime).toLocaleString()}.`;
-        await notifyViaAllChannels({
-          ownerId: doctor,
-          email: doctorDoc.email,
-          phone: doctorDoc.phone,
-          subject: "New clinic visit request pending confirmation",
-          text: doctorMessage,
-          pushTitle: "Clinic booking request",
-          pushBody: doctorMessage,
-          pushData: { 
-            consultationId: String(consultation._id), 
-            status: consultation.status, 
-            type: "in_person_pending",
-            route: '/notification',
-          },
-        });
-      } else {
-        // Online consultation — notify the patient that their booking is confirmed
-        const doctorName = doctorDoc.name || doctorDoc.fullName || 'your doctor';
-        const apptStr = new Date(consultation.appointmentTime).toLocaleString();
-        const patientBookingMsg = `Your consultation with ${doctorName} is booked for ${apptStr}. We'll remind you 30 minutes and 5 minutes before it starts.`;
-        await notifyViaAllChannels({
-          ownerId: patient,
-          email: patientEmail || patient_?.email,
-          phone: patient_?.phone || '',
-          subject: 'Consultation booking confirmed',
-          text: patientBookingMsg,
-          pushTitle: '✅ Consultation Booked',
-          pushBody: patientBookingMsg,
-          pushData: {
-            consultationId: String(consultation._id),
-            roomId: consultation.roomId,
-            type: 'consultation_booked',
-            route: '/appoint',
-          },
-        });
-      }
+      const appointmentLabel = new Date(consultation.appointmentTime).toLocaleString();
+      const doctorName = doctorDoc.name || 'your doctor';
+      await Promise.allSettled([
+        notifyUser({
+          userId: doctor,
+          type: 'consultation_request',
+          title: 'New consultation request',
+          body: `A patient requested a consultation for ${appointmentLabel}.`,
+          balancedTitle: 'New consultation request',
+          balancedBody: `Review and confirm or reschedule the consultation for ${appointmentLabel}.`,
+          genericTitle: 'New consultation request',
+          genericBody: 'Open the doctor portal to review the request.',
+          route: '/dashboard/consultations',
+          data: { consultationId: String(consultation._id), status: consultation.status },
+        }),
+        notifyUser({
+          userId: patient,
+          type: 'consultation_pending',
+          title: 'Consultation request sent',
+          body: `Your consultation with ${doctorName} for ${appointmentLabel} is awaiting confirmation.`,
+          balancedTitle: 'Consultation awaiting confirmation',
+          balancedBody: `Your consultation with ${doctorName} is awaiting confirmation.`,
+          genericTitle: 'Consultation request sent',
+          genericBody: 'Your consultation is awaiting doctor confirmation.',
+          route: '/appoint',
+          data: { consultationId: String(consultation._id), roomId: consultation.roomId, status: consultation.status },
+        }),
+      ]);
 
       res.status(201).json(consultation);
     } catch (err) {
@@ -811,8 +838,8 @@ router.put('/:id/confirm', doctorAuth, async (req, res) => {
       return res.status(403).json({ message: 'Only assigned doctor can confirm this booking' });
     }
 
-    if (consultation.status !== 'pending') {
-      return res.status(400).json({ message: 'Only pending consultation can be confirmed' });
+    if (!['pending', 'scheduled'].includes(consultation.status)) {
+      return res.status(400).json({ message: 'Only pending consultations can be confirmed' });
     }
 
     consultation.status = 'confirmed';
@@ -821,19 +848,19 @@ router.put('/:id/confirm', doctorAuth, async (req, res) => {
     consultation.updatedAt = new Date();
     await consultation.save();
 
-    const patientMessage = `Your clinic visit with ${consultation?.doctor_?.name || 'doctor'} is confirmed for ${new Date(consultation.appointmentTime).toLocaleString()}.`;
+    const patientMessage = `Your consultation with ${consultation?.doctor_?.name || 'doctor'} is confirmed for ${new Date(consultation.appointmentTime).toLocaleString()}.`;
     await notifyViaAllChannels({
       ownerId: consultation.patient,
       email: consultation.patientEmail || consultation?.patient_?.email,
       phone: consultation.patientPhone || consultation?.patient_?.phone,
-      subject: 'Clinic visit confirmed',
+      subject: 'Consultation confirmed',
       text: patientMessage,
-      pushTitle: 'Clinic visit confirmed',
+      pushTitle: 'Consultation confirmed',
       pushBody: patientMessage,
       pushData: { 
         consultationId: String(consultation._id), 
         status: consultation.status, 
-        type: 'in_person_confirmed',
+        type: 'consultation_confirmed',
         route: '/notification', // Links to notifications page for consultation details
       },
     });
@@ -841,6 +868,133 @@ router.put('/:id/confirm', doctorAuth, async (req, res) => {
     res.json(consultation);
   } catch (err) {
     res.status(500).json({ message: 'Failed to confirm consultation', error: err.message });
+  }
+});
+
+router.put('/:id/reject', doctorAuth, async (req, res) => {
+  try {
+    const consultation = await Consultation.findById(req.params.id);
+    if (!consultation) return res.status(404).json({ message: 'Consultation not found' });
+    if (String(consultation.doctor) !== req.doctorId) {
+      return res.status(403).json({ message: 'Only the assigned doctor can reject this consultation' });
+    }
+    if (!['pending', 'scheduled'].includes(consultation.status)) {
+      return res.status(400).json({ message: 'Only pending consultations can be rejected' });
+    }
+
+    const originalPayment = consultation.paymentTransaction
+      ? await Transaction.findById(consultation.paymentTransaction)
+      : consultation.bookingPaymentReference
+        ? await Transaction.findOne({
+          user: consultation.patient,
+          status: 'completed',
+          'metadata.consultationBookingReference': consultation.bookingPaymentReference,
+        })
+        : null;
+    let refundStatus = 'unavailable';
+
+    if (originalPayment?.status === 'completed') {
+      const session = await mongoose.startSession();
+      session.startTransaction();
+      try {
+        const payment = await Transaction.findOne({
+          _id: originalPayment._id,
+          user: consultation.patient,
+          status: 'completed',
+        }).session(session);
+        if (!payment || payment.type !== 'consultation' || Number(payment.amount) <= 0) {
+          throw new Error('Original consultation payment is not refundable');
+        }
+
+        const existingRefund = await Transaction.findOne({ refundOf: payment._id }).session(session);
+        if (existingRefund) {
+          refundStatus = 'completed';
+        } else {
+          const [patientWallet, recipientWallet] = await Promise.all([
+            Wallet.findOne({ user: payment.user }).session(session),
+            payment.provider ? Wallet.findOne({ user: payment.provider }).session(session) : null,
+          ]);
+          if (!patientWallet || !recipientWallet || Number(recipientWallet.balance) < Number(payment.amount)) {
+            refundStatus = 'failed';
+          } else {
+            const amount = Number(payment.amount);
+            const patientPreviousBalance = Number(patientWallet.balance || 0);
+            const recipientPreviousBalance = Number(recipientWallet.balance || 0);
+            patientWallet.balance = patientPreviousBalance + amount;
+            patientWallet.totalDeposits = Number(patientWallet.totalDeposits || 0) + amount;
+            patientWallet.lastTransaction = new Date();
+            recipientWallet.balance = recipientPreviousBalance - amount;
+            recipientWallet.totalWithdrawals = Number(recipientWallet.totalWithdrawals || 0) + amount;
+            recipientWallet.lastTransaction = new Date();
+            await Promise.all([patientWallet.save({ session }), recipientWallet.save({ session })]);
+
+            await Transaction.create([{
+              wallet: patientWallet._id,
+              user: payment.user,
+              provider: payment.provider,
+              type: 'refund',
+              amount,
+              previousBalance: patientPreviousBalance,
+              newBalance: patientWallet.balance,
+              status: 'completed',
+              paymentMethod: 'wallet',
+              description: `Refund for rejected consultation ${consultation._id}`,
+              reference: `CONSULTATION-REFUND-${payment._id}`,
+              refundOf: payment._id,
+              metadata: { consultationId: String(consultation._id) },
+              completedAt: new Date(),
+            }], { session });
+            refundStatus = 'completed';
+          }
+        }
+
+        consultation.status = 'cancelled';
+        consultation.rejectionReason = String(req.body?.reason || 'Doctor unavailable').trim().slice(0, 500);
+        consultation.refundStatus = refundStatus;
+        consultation.updatedAt = new Date();
+        await consultation.save({ session });
+        await session.commitTransaction();
+      } catch (error) {
+        await session.abortTransaction();
+        if (error?.code === 11000) {
+          return res.status(409).json({ message: 'This consultation refund has already been processed' });
+        }
+        throw error;
+      } finally {
+        await session.endSession();
+      }
+    } else {
+      consultation.status = 'cancelled';
+      consultation.rejectionReason = String(req.body?.reason || 'Doctor unavailable').trim().slice(0, 500);
+      consultation.refundStatus = 'unavailable';
+      consultation.updatedAt = new Date();
+      await consultation.save();
+    }
+
+    const notificationBody = refundStatus === 'completed'
+      ? `Your consultation with ${req.doctor.name} was declined. The full payment has been returned to your Qureo wallet.`
+      : refundStatus === 'failed'
+        ? `Your consultation with ${req.doctor.name} was declined. We could not complete the automatic refund; please contact support.`
+        : `Your consultation with ${req.doctor.name} was declined. No linked wallet payment was found, so no automatic refund was made.`;
+    await notifyUser({
+      userId: consultation.patient,
+      type: 'consultation_rejected',
+      title: 'Consultation declined',
+      body: notificationBody,
+      balancedTitle: 'Consultation declined',
+      balancedBody: notificationBody,
+      genericTitle: 'Consultation update',
+      genericBody: 'Your doctor declined the consultation request.',
+      route: '/appoint',
+      data: {
+        consultationId: String(consultation._id),
+        status: consultation.status,
+        refundStatus,
+      },
+    });
+    return res.json({ consultation, refundStatus });
+  } catch (err) {
+    return res.status(500).json({ message: 'Failed to reject consultation', error: err.message });
   }
 });
 
@@ -875,23 +1029,59 @@ router.put('/:id/no-show', doctorAuth, async (req, res) => {
 });
 
 // Reschedule consultation
-router.put("/:id/reschedule", auth, async (req, res) => {
+router.put("/:id/reschedule", doctorAuth, async (req, res) => {
   try {
     const { appointmentTime } = req.body;
-    const existing = await Consultation.findById(req.params.id).lean();
+    const newAppointmentTime = new Date(appointmentTime);
+    if (!appointmentTime || Number.isNaN(newAppointmentTime.getTime()) || newAppointmentTime <= new Date()) {
+      return res.status(400).json({ message: "Choose a valid future appointment time" });
+    }
+    const existing = await Consultation.findById(req.params.id);
     if (!existing) {
       return res.status(404).json({ message: "Consultation not found" });
     }
+    if (String(existing.doctor) !== req.doctorId) {
+      return res.status(403).json({ message: "Only the assigned doctor can reschedule this consultation" });
+    }
+    if (!['pending', 'scheduled', 'confirmed'].includes(existing.status)) {
+      return res.status(400).json({ message: "Only upcoming consultations can be rescheduled" });
+    }
 
-    const nextStatus = existing.consultationType === 'in-person' || existing.mode === 'in-person'
-      ? 'pending'
-      : 'scheduled';
+    const doctor = await Doctor.findById(req.doctorId).select('availability').lean();
+    const hasDoctorSchedule = Object.values(doctor?.availability || {}).some((slots) => Array.isArray(slots) && slots.length > 0);
+    if ((existing.mode === 'in-person' || hasDoctorSchedule) && !isSlotAvailableFromDoctorSchedule(doctor, newAppointmentTime)) {
+      return res.status(400).json({ message: "New time is outside your availability" });
+    }
 
-    const consultation = await Consultation.findByIdAndUpdate(
-      req.params.id,
-      { appointmentTime, status: nextStatus, updatedAt: new Date(), notifiedBefore: false, notifiedStart: false },
-      { new: true }
-    );
+    const conflict = await Consultation.findOne({
+      _id: { $ne: existing._id },
+      doctor: req.doctorId,
+      appointmentTime: newAppointmentTime,
+      status: { $in: STATUS_ACTIVE_FOR_CONFLICT },
+    }).lean();
+    if (conflict) return res.status(409).json({ message: "That appointment time is already booked" });
+
+    existing.appointmentTime = newAppointmentTime;
+    existing.status = 'pending';
+    existing.confirmedByDoctorId = null;
+    existing.confirmedAt = null;
+    existing.notified30min = false;
+    existing.notifiedBefore = false;
+    existing.notifiedStart = false;
+    existing.updatedAt = new Date();
+    const consultation = await existing.save();
+    await notifyUser({
+      userId: consultation.patient,
+      type: 'consultation_rescheduled',
+      title: 'Consultation time changed',
+      body: `Your doctor proposed a new time: ${newAppointmentTime.toLocaleString()}. Please confirm the updated appointment.`,
+      balancedTitle: 'Consultation rescheduled',
+      balancedBody: `Your consultation has been moved to ${newAppointmentTime.toLocaleString()} and is awaiting confirmation.`,
+      genericTitle: 'Consultation time changed',
+      genericBody: 'Your doctor proposed a new consultation time.',
+      route: '/appoint',
+      data: { consultationId: String(consultation._id), status: consultation.status },
+    });
     res.json(consultation);
   } catch (err) {
     res.status(500).json({ message: "Failed to reschedule consultation", error: err.message });
@@ -899,24 +1089,99 @@ router.put("/:id/reschedule", auth, async (req, res) => {
 });
 
 // Mark consultation completed (used when paid time expires in call room)
-router.put("/:id/complete", async (req, res) => {
+router.put("/:id/complete", consultationActorAuth, async (req, res) => {
   try {
     const { reason = "time_elapsed", endedAt = new Date().toISOString(), callDuration } = req.body || {};
-    const update = {
-      status: "completed",
-      updatedAt: new Date(),
-      endedAt: new Date(endedAt),
-      completionReason: reason,
-    };
+    const session = await mongoose.startSession();
+    session.startTransaction();
+    let consultation;
+    try {
+      consultation = await Consultation.findById(req.params.id).session(session);
+      if (!consultation) {
+        await session.abortTransaction();
+        return res.status(404).json({ message: "Consultation not found" });
+      }
+      const isDoctor = Boolean(req.doctorId);
+      const isParticipant = isDoctor
+        ? String(consultation.doctor) === req.doctorId
+        : String(consultation.patient) === req.userId;
+      if (!isParticipant) {
+        await session.abortTransaction();
+        return res.status(403).json({ message: "Only a consultation participant can complete this booking" });
+      }
+      if (consultation.status === 'completed') {
+        await session.commitTransaction();
+        return res.json({ success: true, consultation, alreadyCompleted: true });
+      }
+      if (!['confirmed', 'ongoing', 'scheduled'].includes(consultation.status)) {
+        await session.abortTransaction();
+        return res.status(409).json({ message: "The consultation must be confirmed before it can be completed" });
+      }
 
-    if (Number.isFinite(Number(callDuration)) && Number(callDuration) >= 0) {
-      update.callDuration = Number(callDuration);
-    }
+      const payment = consultation.paymentTransaction
+        ? await Transaction.findOne({ _id: consultation.paymentTransaction, status: 'completed' }).session(session)
+        : null;
+      if (payment && Number(consultation.paidAmount) > 0) {
+        const existingEarning = await Transaction.findOne({ earningFor: consultation._id }).session(session);
+        if (!existingEarning) {
+          const [escrowWallet, doctorWallet] = await Promise.all([
+            payment.provider ? Wallet.findOne({ user: payment.provider }).session(session) : null,
+            Wallet.findOneAndUpdate(
+              { user: consultation.doctor },
+              { $setOnInsert: { balance: 0, currency: 'USD', status: 'active' } },
+              { upsert: true, new: true, setDefaultsOnInsert: true, session }
+            ),
+          ]);
+          const amount = Number(consultation.paidAmount);
+          if (!escrowWallet || Number(escrowWallet.balance || 0) < amount) {
+            await session.abortTransaction();
+            return res.status(409).json({ message: "Consultation funds are unavailable for payout" });
+          }
+          const escrowPreviousBalance = Number(escrowWallet.balance || 0);
+          const doctorPreviousBalance = Number(doctorWallet.balance || 0);
+          escrowWallet.balance = escrowPreviousBalance - amount;
+          escrowWallet.totalWithdrawals = Number(escrowWallet.totalWithdrawals || 0) + amount;
+          escrowWallet.lastTransaction = new Date();
+          doctorWallet.balance = doctorPreviousBalance + amount;
+          doctorWallet.totalDeposits = Number(doctorWallet.totalDeposits || 0) + amount;
+          doctorWallet.lastTransaction = new Date();
+          await Promise.all([escrowWallet.save({ session }), doctorWallet.save({ session })]);
+          await Transaction.create([{
+            wallet: doctorWallet._id,
+            user: consultation.doctor,
+            provider: payment.provider,
+            type: 'consultation_earning',
+            amount,
+            previousBalance: doctorPreviousBalance,
+            newBalance: doctorWallet.balance,
+            status: 'completed',
+            paymentMethod: 'wallet',
+            description: `Earnings for consultation ${consultation._id}`,
+            reference: `CONSULTATION-EARNING-${consultation._id}`,
+            earningFor: consultation._id,
+            metadata: { sourceTransactionId: String(payment._id) },
+            completedAt: new Date(),
+          }], { session });
+        }
+      }
 
-    const consultation = await Consultation.findByIdAndUpdate(req.params.id, update, { new: true });
-
-    if (!consultation) {
-      return res.status(404).json({ message: "Consultation not found" });
+      consultation.status = 'completed';
+      consultation.updatedAt = new Date();
+      consultation.endedAt = new Date(endedAt);
+      consultation.completionReason = reason;
+      if (Number.isFinite(Number(callDuration)) && Number(callDuration) >= 0) {
+        consultation.callDuration = Number(callDuration);
+      }
+      await consultation.save({ session });
+      await session.commitTransaction();
+    } catch (error) {
+      await session.abortTransaction();
+      if (error?.code === 11000) {
+        return res.status(409).json({ message: 'Consultation earnings have already been released' });
+      }
+      throw error;
+    } finally {
+      await session.endSession();
     }
 
     try {

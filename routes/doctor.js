@@ -1,11 +1,20 @@
 const express = require("express");
 const router = express.Router();
+const mongoose = require('mongoose');
+const crypto = require('crypto');
 const Doctor = require("../models/Doctor");
 const Consultation = require('../models/Consultations');
+const Transaction = require('../models/Transaction');
 const bcrypt = require("bcryptjs");
 const doctorAuth = require('../middleware/doctorAuth');
 const jwt = require("jsonwebtoken")// ✅ Register Doctor
 const { notifyUser } = require('../utils/notifyUser');
+const Wallet = require('../models/Wallet');
+
+const JWT_SECRET =
+  process.env.JWT_SECRET ||
+  process.env.AUTH_SECRET ||
+  (process.env.NODE_ENV === 'production' ? '' : 'qureo-local-dev-auth-secret');
 
 // ✅ Register Doctor
 router.post("/", async (req, res) => {
@@ -89,6 +98,11 @@ router.post("/", async (req, res) => {
     });
 
     await newDoctor.save();
+    await Wallet.findOneAndUpdate(
+      { user: newDoctor._id },
+      { $setOnInsert: { balance: 0, currency: 'USD', status: 'active' } },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
 
     try {
       await notifyUser({
@@ -114,9 +128,11 @@ router.post("/", async (req, res) => {
     const doctorResponse = newDoctor.toObject();
     delete doctorResponse.passwordHash;
 
+    const token = jwt.sign({ sub: String(newDoctor._id), role: 'doctor' }, JWT_SECRET, { expiresIn: '7d' });
     res.status(201).json({
       message: "Doctor registered successfully",
       doctor: doctorResponse,
+      token,
     });
   } catch (error) {
     console.error(error);
@@ -158,6 +174,13 @@ router.post("/login", async (req, res) => {
     const doctorResponse = doctor.toObject();
     delete doctorResponse.passwordHash;
 
+    await Wallet.findOneAndUpdate(
+      { user: doctor._id },
+      { $setOnInsert: { balance: 0, currency: 'USD', status: 'active' } },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+    const token = jwt.sign({ sub: String(doctor._id), role: 'doctor' }, JWT_SECRET, { expiresIn: '7d' });
+
     try {
       const upcomingPatients = await Consultation.find({
         doctor: doctor._id,
@@ -192,6 +215,7 @@ router.post("/login", async (req, res) => {
 
       message: "Login successful",
       doctor: doctorResponse,
+      token,
     });
 
     
@@ -508,6 +532,114 @@ router.get("/online", async (req, res) => {
 
 
 // Get currently authenticated doctor profile
+router.put('/availability', doctorAuth, async (req, res) => {
+  try {
+    const dayNames = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+    const input = req.body?.availability;
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+      return res.status(400).json({ message: 'Availability schedule is required' });
+    }
+
+    const availability = {};
+    for (const day of dayNames) {
+      const slots = input[day] ?? [];
+      if (!Array.isArray(slots) || slots.length > 8) {
+        return res.status(400).json({ message: `Availability for ${day} must contain up to 8 time slots` });
+      }
+      const normalizedSlots = slots.map((slot) => String(slot).trim());
+      const parsedSlots = normalizedSlots.map((slot) => {
+        const match = /^(\d{2}):(\d{2})-(\d{2}):(\d{2})$/.exec(slot);
+        if (!match) return null;
+        const start = Number(match[1]) * 60 + Number(match[2]);
+        const end = Number(match[3]) * 60 + Number(match[4]);
+        return start < end && Number(match[1]) < 24 && Number(match[2]) < 60 && Number(match[3]) < 24 && Number(match[4]) < 60
+          ? { start, end, value: slot }
+          : null;
+      });
+      if (parsedSlots.some((slot) => !slot)) {
+        return res.status(400).json({ message: `Availability for ${day} contains an invalid time range` });
+      }
+      parsedSlots.sort((a, b) => a.start - b.start);
+      if (parsedSlots.some((slot, index) => index > 0 && slot.start < parsedSlots[index - 1].end)) {
+        return res.status(400).json({ message: `Availability for ${day} contains overlapping time slots` });
+      }
+      availability[day] = parsedSlots.map((slot) => slot.value);
+    }
+
+    req.doctor.availability = availability;
+    await req.doctor.save();
+    return res.json({ availability: req.doctor.availability });
+  } catch (err) {
+    return res.status(500).json({ message: 'Failed to update availability', error: err.message });
+  }
+});
+
+router.get('/wallet', doctorAuth, async (req, res) => {
+  try {
+    const wallet = await Wallet.findOneAndUpdate(
+      { user: req.doctorId },
+      { $setOnInsert: { balance: 0, currency: 'USD', status: 'active' } },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+    const transactions = await Transaction.find({ user: req.doctorId }).sort({ createdAt: -1 }).limit(100).lean();
+    return res.json({ wallet, transactions });
+  } catch (err) {
+    return res.status(500).json({ message: 'Failed to load doctor wallet', error: err.message });
+  }
+});
+
+router.post('/wallet/withdraw', doctorAuth, async (req, res) => {
+  const amount = Number(req.body?.amount);
+  const withdrawalMethod = String(req.body?.withdrawalMethod || 'bank_transfer');
+  const accountDetails = req.body?.accountDetails;
+  if (!Number.isFinite(amount) || amount <= 0 || amount > 1000000) {
+    return res.status(400).json({ message: 'Enter a valid withdrawal amount' });
+  }
+  if (!accountDetails || typeof accountDetails !== 'object' || !Object.values(accountDetails).some((value) => String(value || '').trim())) {
+    return res.status(400).json({ message: 'Withdrawal account details are required' });
+  }
+
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  try {
+    const wallet = await Wallet.findOne({ user: req.doctorId }).session(session);
+    if (!wallet || wallet.status !== 'active') {
+      await session.abortTransaction();
+      return res.status(404).json({ message: 'Active wallet not found' });
+    }
+    if (Number(wallet.balance) < amount) {
+      await session.abortTransaction();
+      return res.status(400).json({ message: 'Withdrawal amount exceeds your available balance' });
+    }
+
+    const previousBalance = Number(wallet.balance || 0);
+    wallet.balance = previousBalance - amount;
+    wallet.totalWithdrawals = Number(wallet.totalWithdrawals || 0) + amount;
+    wallet.lastTransaction = new Date();
+    await wallet.save({ session });
+    const [transaction] = await Transaction.create([{
+      wallet: wallet._id,
+      user: req.doctor._id,
+      type: 'withdrawal',
+      amount,
+      previousBalance,
+      newBalance: wallet.balance,
+      status: 'pending',
+      paymentMethod: withdrawalMethod,
+      description: `Doctor withdrawal request of $${amount.toFixed(2)}`,
+      reference: `DOC-WITH-${crypto.randomUUID()}`,
+      metadata: { accountDetails },
+    }], { session });
+    await session.commitTransaction();
+    return res.status(202).json({ message: 'Withdrawal request submitted', transactionId: transaction._id, balance: wallet.balance });
+  } catch (err) {
+    await session.abortTransaction();
+    return res.status(500).json({ message: 'Failed to submit withdrawal request', error: err.message });
+  } finally {
+    await session.endSession();
+  }
+});
+
 router.get('/me', doctorAuth, async (req, res) => {
   try {
     // doctorAuth attaches `req.doctor`
