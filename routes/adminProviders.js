@@ -16,7 +16,7 @@ const MAX_REASON_LENGTH = 500;
  */
 const RESOURCES = {
   pharmacy: { model: Pharmacy, collection: 'pharmacies' },
-  lab: { model: HealthcareProvider, collection: 'labs', extraFilter: { type: 'lab' } },
+  lab: { model: Provider, collection: 'labs', extraFilter: { providerType: 'lab' } },
   payment: { model: Provider, collections: ['payments', 'providers'] },
 };
 
