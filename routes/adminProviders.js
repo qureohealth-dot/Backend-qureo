@@ -3,7 +3,6 @@ const auth = require('../middleware/auth');
 const { requireAdmin } = require('../middleware/adminAuth');
 const Pharmacy = require('../models/Pharmacy');
 const Provider = require('../models/Provider');
-const HealthcareProvider = require('../models/HealthcareProvider');
 
 const router = express.Router();
 

@@ -227,6 +227,7 @@ const allowedOrigins = [
   'https://qureo-pharmacies.vercel.app',
   'https://qureohealth.com',
   'https://qureo.vercel.app',
+  'https://qureo-lab.vercel.app',
   'https://qureodoctor.vercel.app',
   'https://qureohealth.vercel.app',
   'https://qureodoctor.vercel.app',
