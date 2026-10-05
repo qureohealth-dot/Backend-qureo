@@ -67,6 +67,13 @@ router.post("/login", async (req, res) => {
 
     if (!provider) return res.status(404).json({ error: "Provider not found" });
 
+    if (provider.isSuspended) {
+      return res.status(403).json({
+        error: "This provider account has been suspended. Contact Qureo support.",
+        suspendedReason: provider.suspendedReason || null,
+      });
+    }
+
     const isMatch = await provider.matchPassword(password);
     if (!isMatch) return res.status(401).json({ error: "Invalid credentials" });
 
@@ -249,7 +256,7 @@ router.get("/health-wallet", async (req, res) => {
 // FIND provider by ID
 router.get("/:id", async (req, res) => {
   try {
-    const provider = await Provider.findById(req.params.id);
+    const provider = await Provider.findById(req.params.id).select("-password");
 
     if (!provider)
       return res.status(404).json({ error: "Provider not found" });
@@ -269,7 +276,7 @@ router.get("/:id", async (req, res) => {
 
 router.get("/", async (req, res) => {
   try {
-    const providers = await Provider.find();
+    const providers = await Provider.find().select("-password");
     res.json({ providers });
   } catch (err) {
     console.error("Fetch providers error:", err);

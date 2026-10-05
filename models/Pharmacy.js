@@ -23,6 +23,11 @@ const pharmacySchema = new mongoose.Schema(
     verified: { type: Boolean, default: false },
     deliveryAvailable: { type: Boolean, default: true },
     categories: { type: [String], default: [] },
+
+    // ✅ Admin moderation
+    isSuspended: { type: Boolean, default: false },
+    suspendedAt: { type: Date },
+    suspendedReason: { type: String },
   },
   { timestamps: true }
 );

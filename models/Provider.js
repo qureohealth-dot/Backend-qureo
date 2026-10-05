@@ -11,6 +11,11 @@ const providerSchema = new mongoose.Schema(
     logo: String, // optional Cloudinary image
     providerType: { type: String, default: null },
     verified: { type: Boolean, default: false },
+
+    // Admin moderation
+    isSuspended: { type: Boolean, default: false },
+    suspendedAt: { type: Date },
+    suspendedReason: { type: String },
   },
   { timestamps: true }
 );

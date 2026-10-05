@@ -16,6 +16,9 @@ const healthcareProviderSchema = new mongoose.Schema({
   icon: String,
   color: String,
   isActive: { type: Boolean, default: true },
+  isSuspended: { type: Boolean, default: false },
+  suspendedAt: { type: Date },
+  suspendedReason: { type: String },
   createdAt: { type: Date, default: Date.now }
 });
 

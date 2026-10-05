@@ -25,6 +25,8 @@ const orderSchema = new mongoose.Schema({
 },
 
   paymentMethod: { type: String, enum: ['Cash', 'Card', 'Mobile', 'Qureo-Wallet'], default: 'Cash' },
+  paymentStatus: { type: String, enum: ['pending', 'paid', 'refunded'], default: 'pending' },
+  paymentTransaction: { type: mongoose.Schema.Types.ObjectId, ref: 'Transaction', default: null },
 }, { timestamps: true });
 
 module.exports = mongoose.model('Order', orderSchema);

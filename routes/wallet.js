@@ -10,6 +10,10 @@ const InsuranceSubscription = require('../models/InsuranceSubscription');
 const Stripe = require("stripe")
 const Provider = require("../models/Provider")
 const Pharmacy = require('../models/Pharmacy');
+const Cart = require('../models/Cart');
+const PharmacyWallet = require('../models/PharmacyWallet');
+const PharmacyWalletTransaction = require('../models/PharmacyWalletTransaction');
+const Order = require('../models/Order');
 const Dependent = require('../models/Dependent');
 const DonorVoucher = require('../models/DonorVoucher');
 const { notifyUser } = require('../utils/notifyUser');
@@ -774,17 +778,61 @@ router.post('/withdraw', async (req, res) => {
 
 
 // Pay provider
-router.post('/pay-provider', async (req, res) => {
+router.post('/pay-provider', auth, async (req, res) => {
   try {
-    const { userId, providerId, amount, serviceDetails, type, dependentId = null } = req.body;
+    const { providerId, pharmacyId, amount, serviceDetails, type, dependentId = null, deliveryInfo } = req.body;
+    const userId = req.userId;
 
-    if (!userId) return res.status(400).json({ error: 'userId is required' });
-    if (!providerId || !amount || amount <= 0) {
-      return res.status(400).json({ error: 'Provider ID and valid amount required' });
+    if (!userId) return res.status(401).json({ error: 'Authentication required' });
+    if (!providerId && !pharmacyId) {
+      return res.status(400).json({ error: 'Provider ID or pharmacy ID is required' });
     }
 
-    const provider = await Provider.findById(providerId);
-    if (!provider) return res.status(404).json({ error: 'Provider not found' });
+    let pharmacy = null;
+    let pharmacyCart = null;
+    let pharmacySubtotal = 0;
+    let paymentAmount = Number(amount);
+    if (pharmacyId) {
+      pharmacyCart = await Cart.findOne({ user: userId }).populate('items.medicine');
+      if (!pharmacyCart || !pharmacyCart.items?.length) {
+        return res.status(400).json({ error: 'Your medicine cart is empty' });
+      }
+
+      pharmacy = mongoose.isValidObjectId(pharmacyId)
+        ? await Pharmacy.findById(pharmacyId)
+        : await Pharmacy.findOne({ name: { $regex: `^${String(pharmacyId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' } });
+
+      if (!pharmacy) return res.status(404).json({ error: 'Pharmacy not found for this purchase' });
+      if (!pharmacyCart.items.every((item) => {
+        if (!item.medicine) return false;
+        const owner = String(item.medicine?.pharmacy || '').trim();
+        return owner.toLowerCase() === pharmacy.name.trim().toLowerCase() || owner === String(pharmacy._id);
+      })) {
+        return res.status(400).json({ error: 'All medicines in the cart must belong to the selected pharmacy' });
+      }
+
+      const subtotalCents = pharmacyCart.items.reduce((sum, item) => {
+        const priceCents = Math.round(Number(item.medicine.price) * 100);
+        const quantity = Number(item.quantity);
+        if (!Number.isSafeInteger(priceCents) || priceCents <= 0 || !Number.isSafeInteger(quantity) || quantity <= 0) {
+          throw new Error('Cart contains an invalid item price or quantity');
+        }
+        return sum + priceCents * quantity;
+      }, 0);
+      pharmacySubtotal = subtotalCents / 100;
+      paymentAmount = (subtotalCents + 800) / 100;
+      if (!Number.isFinite(Number(amount)) || Math.round(Number(amount) * 100) !== Math.round(paymentAmount * 100)) {
+        return res.status(409).json({ error: 'Cart total changed. Refresh checkout and try again.' });
+      }
+      if (!deliveryInfo?.fullName || !deliveryInfo?.address || !deliveryInfo?.phone) {
+        return res.status(400).json({ error: 'Delivery details are required for medicine orders' });
+      }
+    } else if (!Number.isFinite(paymentAmount) || paymentAmount <= 0) {
+      return res.status(400).json({ error: 'A valid payment amount is required' });
+    }
+
+    const provider = pharmacy ? null : await Provider.findById(providerId);
+    if (!pharmacy && !provider) return res.status(404).json({ error: 'Provider not found' });
 
     const session = await mongoose.startSession();
     session.startTransaction();
@@ -803,7 +851,7 @@ router.post('/pay-provider', async (req, res) => {
           dependentAllocation = (wallet.dependentSupportAllocations || []).find(
             (allocation) => String(allocation.dependentId) === String(dependentId) && allocation.active
           );
-          if (!dependentAllocation || Number(dependentAllocation.availableAmount || 0) < Number(amount)) {
+          if (!dependentAllocation || Number(dependentAllocation.availableAmount || 0) < paymentAmount) {
             throw new Error('Insufficient dependent wallet balance');
           }
         } else {
@@ -813,40 +861,56 @@ router.post('/pay-provider', async (req, res) => {
         }
       }
 
-      if (wallet.balance < amount) {
+      if (wallet.balance < paymentAmount) {
         throw new Error('Insufficient balance');
       }
 
       const previousBalance = wallet.balance;
-      const newBalance = previousBalance - parseFloat(amount);
+      const newBalance = previousBalance - paymentAmount;
 
       wallet.balance = newBalance;
       if (dependentAllocation) {
-        dependentAllocation.availableAmount = Number(dependentAllocation.availableAmount || 0) - Number(amount);
-        wallet.reservedFunds.familySupport = Math.max(0, Number(wallet.reservedFunds.familySupport || 0) - Number(amount));
+        dependentAllocation.availableAmount = Number(dependentAllocation.availableAmount || 0) - paymentAmount;
+        wallet.reservedFunds.familySupport = Math.max(0, Number(wallet.reservedFunds.familySupport || 0) - paymentAmount);
       }
       wallet.lastTransaction = new Date();
       await wallet.save({ session });
 
       // 2️⃣ Get provider wallet
-      const wallet2 = await Wallet.findOne({ user: providerId }).session(session);
-
-      if (!wallet2) throw new Error('Provider wallet not found');
-
-      const providerPreviousBalance = wallet2.balance;
-      const providerNewBalance = providerPreviousBalance + parseFloat(amount);
-
-      wallet2.balance = providerNewBalance;
-      wallet2.lastTransaction = new Date();
-      await wallet2.save({ session });
+      let wallet2 = null;
+      let providerNewBalance = null;
+      let pharmacyWallet = null;
+      let pharmacyPreviousBalance = null;
+      if (pharmacy) {
+        pharmacyWallet = await PharmacyWallet.findOneAndUpdate(
+          { pharmacy: pharmacy._id },
+          { $setOnInsert: { balance: 0, currency: 'USD', status: 'active' } },
+          { upsert: true, new: true, setDefaultsOnInsert: true, session }
+        );
+        if (pharmacyWallet.status !== 'active') throw new Error('Pharmacy wallet is not active');
+        pharmacyPreviousBalance = Number(pharmacyWallet.balance || 0);
+        providerNewBalance = pharmacyPreviousBalance + pharmacySubtotal;
+        pharmacyWallet.balance = providerNewBalance;
+        pharmacyWallet.totalReceived = Number(pharmacyWallet.totalReceived || 0) + pharmacySubtotal;
+        pharmacyWallet.lastTransaction = new Date();
+        await pharmacyWallet.save({ session });
+      } else {
+        wallet2 = await Wallet.findOne({ user: providerId }).session(session);
+        if (!wallet2) throw new Error('Provider wallet not found');
+        const providerPreviousBalance = wallet2.balance;
+        providerNewBalance = providerPreviousBalance + paymentAmount;
+        wallet2.balance = providerNewBalance;
+        wallet2.lastTransaction = new Date();
+        await wallet2.save({ session });
+      }
 
       // 3️⃣ Save transaction
       const transaction = new Transaction({
         wallet: wallet._id,
         user: userId,
-        provider: providerId,
+        ...(pharmacy ? {} : { provider: providerId }),
         type,
-        amount: parseFloat(amount),
+        amount: paymentAmount,
         previousBalance,
         newBalance,
         status: 'completed',
@@ -856,6 +920,17 @@ router.post('/pay-provider', async (req, res) => {
         reference: `PAY-${Date.now()}`,
         metadata: {
           serviceDetails,
+          ...(pharmacy ? {
+            pharmacyId: String(pharmacy._id),
+            pharmacySubtotal,
+            checkoutFees: 8,
+            pharmacyItems: pharmacyCart.items.map((item) => ({
+              medicine: item.medicine._id,
+              quantity: item.quantity,
+              name: item.medicine.name,
+              price: Number(item.medicine.price),
+            })),
+          } : {}),
           walletSource: linkedSponsorPayment
             ? `family-sponsor:${dependent.owner}`
             : dependent
@@ -867,17 +942,54 @@ router.post('/pay-provider', async (req, res) => {
 
       await transaction.save({ session });
 
+      if (pharmacy) {
+        await PharmacyWalletTransaction.create([{
+          pharmacy: pharmacy._id,
+          wallet: pharmacyWallet._id,
+          sourceTransaction: transaction._id,
+          amount: pharmacySubtotal,
+          previousBalance: pharmacyPreviousBalance,
+          newBalance: providerNewBalance,
+          currency: pharmacyWallet.currency,
+          paymentMethod: 'Qureo-Wallet',
+          description: `Medicine sale (${transaction.reference})`,
+          customer: userId,
+        }], { session });
+
+        const order = new Order({
+          user: userId,
+          items: pharmacyCart.items.map((item) => ({
+            medicine: item.medicine._id,
+            quantity: item.quantity,
+            name: item.medicine.name,
+            price: Number(item.medicine.price),
+          })),
+          totalPrice: paymentAmount,
+          pharmacy: pharmacy._id,
+          paymentMethod: 'Qureo-Wallet',
+          paymentStatus: 'paid',
+          paymentTransaction: transaction._id,
+          status: 'Pending',
+          deliveryInfo,
+        });
+        await order.save({ session });
+        await Cart.deleteOne({ _id: pharmacyCart._id }, { session });
+        transaction.metadata.orderId = String(order._id);
+        transaction.markModified('metadata');
+        await transaction.save({ session });
+      }
+
       await session.commitTransaction();
       session.endSession();
 
       // Non-blocking push notification to payer
       try {
-        const providerName = provider?.name || provider?.email || 'provider';
+        const providerName = pharmacy?.name || provider?.name || provider?.email || 'provider';
         await notifyUser({
           userId,
           type: 'wallet_payment_completed',
           title: 'Payment completed',
-          body: `You paid $${Number(amount).toFixed(2)} to ${providerName}.`,
+          body: `You paid $${paymentAmount.toFixed(2)} to ${providerName}.`,
           balancedTitle: 'Payment completed',
           balancedBody: 'Your wallet payment was completed successfully. Check your wallet balance and Notification. THANKS.',
           genericTitle: 'You have a new update in Qureo',
@@ -885,8 +997,9 @@ router.post('/pay-provider', async (req, res) => {
           route: '/health-wallet',
           data: {
             transactionId: String(transaction._id),
-            providerId: String(providerId),
-            amount: String(Number(amount).toFixed(2)),
+            ...(providerId ? { providerId: String(providerId) } : {}),
+            ...(pharmacy ? { pharmacyId: String(pharmacy._id) } : {}),
+            amount: String(paymentAmount.toFixed(2)),
           },
         });
       } catch (notifyError) {
@@ -895,9 +1008,15 @@ router.post('/pay-provider', async (req, res) => {
 
       res.json({
         success: true,
-        message: `Payment to ${provider.email} successful`,
+        message: `Payment to ${pharmacy?.name || provider?.email} successful`,
         newBalance,
-        transactionId: transaction._id
+        transactionId: transaction._id,
+        ...(pharmacy ? {
+          pharmacyId: String(pharmacy._id),
+          pharmacyWalletBalance: providerNewBalance,
+          pharmacyEarnings: pharmacySubtotal,
+          orderId: transaction.metadata.orderId,
+        } : {}),
       });
 
     } catch (error) {

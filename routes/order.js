@@ -3,7 +3,10 @@ const express = require('express');
 const router = express.Router();
 const Order = require('../models/Order');
 const Cart = require('../models/Cart');
+const Pharmacy = require('../models/Pharmacy');
+const Transaction = require('../models/Transaction');
 const auth = require('../middleware/auth');
+const mongoose = require('mongoose');
 
 const getIO = () => {
   try {
@@ -16,19 +19,50 @@ const getIO = () => {
 // ✅ Create order from cart
 router.post("/", auth, async (req, res) => {
   try {
-    const { paymentMethod } = req.body;
+    const { paymentMethod, pharmacy: requestedPharmacyId, paymentTransactionId } = req.body;
 
     // Populate medicine + its pharmacy reference
     const cart = await Cart.findOne({ user: req.userId })
-      .populate({
-        path: "items.medicine",
-        populate: { path: "pharmacy" },
-      });
+      .populate('items.medicine');
 
     if (!cart || cart.items.length === 0)
       return res.status(400).json({ message: "Cart is empty" });
 
-    const pharmacyId = cart.items[0]?.medicine?.pharmacy?._id || null;
+    const cartPharmacyNames = [...new Set(cart.items.map((item) => String(item.medicine?.pharmacy || '').trim()).filter(Boolean))];
+    let pharmacy = null;
+    if (requestedPharmacyId && mongoose.isValidObjectId(requestedPharmacyId)) {
+      pharmacy = await Pharmacy.findById(requestedPharmacyId);
+    } else if (cartPharmacyNames.length === 1) {
+      const candidate = cartPharmacyNames[0];
+      pharmacy = mongoose.isValidObjectId(candidate)
+        ? await Pharmacy.findById(candidate)
+        : await Pharmacy.findOne({ name: { $regex: `^${candidate.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' } });
+    }
+    if (!pharmacy) return res.status(400).json({ message: 'A valid pharmacy is required for this order' });
+
+    const belongsToPharmacy = cartPharmacyNames.length === 1 && cart.items.every((item) => {
+      const owner = String(item.medicine?.pharmacy || '').trim();
+      return owner.toLowerCase() === pharmacy.name.trim().toLowerCase() || owner === String(pharmacy._id);
+    });
+    if (!belongsToPharmacy) {
+      return res.status(400).json({ message: 'All medicines in the cart must belong to the selected pharmacy' });
+    }
+
+    let paymentTransaction = null;
+    if (paymentTransactionId) {
+      paymentTransaction = await Transaction.findOne({
+        _id: paymentTransactionId,
+        user: req.userId,
+        status: 'completed',
+        'metadata.pharmacyId': String(pharmacy._id),
+      });
+      if (!paymentTransaction) {
+        return res.status(400).json({ message: 'The payment could not be verified for this pharmacy' });
+      }
+      if (paymentTransaction.metadata?.orderId || await Order.exists({ paymentTransaction: paymentTransaction._id })) {
+        return res.status(409).json({ message: 'This payment has already been attached to an order' });
+      }
+    }
     console.log("items", cart.items)
     const order = new Order({
       user: req.userId,
@@ -38,9 +72,11 @@ router.post("/", auth, async (req, res) => {
         name : i.medicine.name,
         price: i.price,
       })),
-      totalPrice: cart.totalPrice,
-      pharmacy: pharmacyId, // ✅ ObjectId reference
+      totalPrice: paymentTransaction?.amount ?? cart.totalPrice,
+      pharmacy: pharmacy._id,
       paymentMethod,
+      paymentStatus: paymentTransaction ? 'paid' : 'pending',
+      paymentTransaction: paymentTransaction?._id || null,
     });
 
    

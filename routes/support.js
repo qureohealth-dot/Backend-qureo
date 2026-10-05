@@ -1,5 +1,6 @@
 const express = require('express');
 const auth = require('../middleware/auth');
+const { requireAdmin } = require('../middleware/adminAuth');
 const SupportTicket = require('../models/SupportTicket');
 
 const router = express.Router();
@@ -72,25 +73,12 @@ router.post('/tickets', auth, async (req, res) => {
 
 /**
  * Support tickets carry personal health data, so admin-wide access is never
- * anonymous. The project has no role field on User, so authorisation is an
- * explicit id allowlist: SUPPORT_ADMIN_IDS=id1,id2 in the environment.
+ * anonymous. Access is gated by the shared admin id allowlist; see
+ * `middleware/adminAuth`.
  */
-function requireSupportAdmin(req, res, next) {
-  const userId = req.userId || req.user?._id;
-  const allowed = (process.env.SUPPORT_ADMIN_IDS || '')
-    .split(',')
-    .map((id) => id.trim())
-    .filter(Boolean);
-
-  if (userId && allowed.includes(String(userId))) {
-    return next();
-  }
-
-  return res.status(403).json({ message: 'Support admin access required' });
-}
 
 // Admin: every ticket across all users, newest first.
-router.get('/admin/tickets', auth, requireSupportAdmin, async (req, res) => {
+router.get('/admin/tickets', auth, requireAdmin, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit) || 100, 500);
     const tickets = await SupportTicket.find()
@@ -104,7 +92,7 @@ router.get('/admin/tickets', auth, requireSupportAdmin, async (req, res) => {
 });
 
 // Admin: move a ticket through its workflow.
-router.patch('/admin/tickets/:id', auth, requireSupportAdmin, async (req, res) => {
+router.patch('/admin/tickets/:id', auth, requireAdmin, async (req, res) => {
   try {
     const allowed = ['open', 'in_progress', 'resolved', 'closed'];
     const { status } = req.body || {};
