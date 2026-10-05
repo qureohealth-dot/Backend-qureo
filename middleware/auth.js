@@ -23,6 +23,12 @@ module.exports = async function authMiddleware(req, res, next) {
         return res.status(401).json({ message: 'Invalid auth token' });
       }
 
+      if (payload?.role === 'admin-console' && userId === 'admin-console') {
+        req.userId = 'admin-console';
+        req.isAdminConsole = true;
+        return next();
+      }
+
       const user = await User.findById(userId).select('_id fullName email authProvider');
       if (!user) {
         return res.status(401).json({ message: 'User no longer exists' });

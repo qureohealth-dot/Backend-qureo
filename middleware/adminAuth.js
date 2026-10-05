@@ -18,7 +18,7 @@ function getAdminIds() {
 function requireAdmin(req, res, next) {
   const userId = req.userId || req.user?._id;
 
-  if (userId && getAdminIds().includes(String(userId))) {
+  if (req.isAdminConsole || (userId && getAdminIds().includes(String(userId)))) {
     return next();
   }
 

@@ -41,6 +41,12 @@ function issueToken(user) {
   );
 }
 
+function secureStringEqual(leftValue, rightValue) {
+  const left = Buffer.from(String(leftValue || ''));
+  const right = Buffer.from(String(rightValue || ''));
+  return left.length > 0 && left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
 async function sendPasswordResetEmail({ email, resetUrl }) {
   const {
     SMTP_HOST,
@@ -203,6 +209,35 @@ router.post('/signin', async (req, res) => {
     console.error(err);
     res.status(500).json({ message: 'Server error' });
   }
+});
+
+router.post('/admin-signin', (req, res) => {
+  const configuredUsername = process.env.ADMIN_LOGIN_USERNAME;
+  const configuredPassword = process.env.ADMIN_LOGIN_PASSWORD;
+
+  if (!configuredUsername || !configuredPassword) {
+    return res.status(503).json({ message: 'Admin console sign-in is not configured on the server' });
+  }
+
+  const usernameMatches = secureStringEqual(req.body?.username, configuredUsername);
+  const passwordMatches = secureStringEqual(req.body?.password, configuredPassword);
+
+  if (!usernameMatches || !passwordMatches) {
+    return res.status(401).json({ message: 'Incorrect username or password' });
+  }
+
+  if (!JWT_SECRET) {
+    return res.status(500).json({ message: 'Authentication is not configured on the server' });
+  }
+
+  const user = { _id: 'admin-console', email: configuredUsername };
+  const token = jwt.sign(
+    { sub: 'admin-console', role: 'admin-console' },
+    JWT_SECRET,
+    { expiresIn: '8h' },
+  );
+
+  return res.json({ user: serializeUser(user), token });
 });
 
 router.post('/forgot-password', async (req, res) => {
