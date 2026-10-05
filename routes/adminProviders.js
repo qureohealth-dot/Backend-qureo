@@ -17,7 +17,7 @@ const MAX_REASON_LENGTH = 500;
 const RESOURCES = {
   pharmacy: { model: Pharmacy, collection: 'pharmacies' },
   lab: { model: HealthcareProvider, collection: 'labs', extraFilter: { type: 'lab' } },
-  payment: { model: Provider, collection: 'providers' },
+  payment: { model: Provider, collections: ['payments', 'providers'] },
 };
 
 const normalise = (kind, doc) => {
@@ -69,20 +69,25 @@ const normalise = (kind, doc) => {
 // Every list route is admin-only: these directories expose partner contact
 // details and moderation state to anyone who can reach the API otherwise.
 Object.keys(RESOURCES).forEach((kind) => {
-  router.get(`/${RESOURCES[kind].collection}`, auth, requireAdmin, async (req, res) => {
-    try {
-      const { model, collection, extraFilter } = RESOURCES[kind];
-      const docs = await model
-        .find(extraFilter || {})
-        .select('-password -confirmPassword')
-        .sort({ createdAt: -1 })
-        .lean();
+  const resource = RESOURCES[kind];
+  const collections = resource.collections || [resource.collection];
 
-      return res.json({ items: docs.map((doc) => normalise(kind, doc)) });
-    } catch (err) {
-      console.error(`admin providers ${kind} list error:`, err);
-      return res.status(500).json({ message: `Failed to fetch ${kind} providers` });
-    }
+  collections.forEach((collection) => {
+    router.get(`/${collection}`, auth, requireAdmin, async (req, res) => {
+      try {
+        const { model, extraFilter } = resource;
+        const docs = await model
+          .find(extraFilter || {})
+          .select('-password -confirmPassword')
+          .sort({ createdAt: -1 })
+          .lean();
+
+        return res.json({ items: docs.map((doc) => normalise(kind, doc)) });
+      } catch (err) {
+        console.error(`admin providers ${kind} list error:`, err);
+        return res.status(500).json({ message: `Failed to fetch ${kind} providers` });
+      }
+    });
   });
 });
 
