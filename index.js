@@ -231,6 +231,7 @@ const allowedOrigins = [
   'https://qureodoctor.vercel.app',
   'https://qureohealth.vercel.app',
   'https://qureodoctor.vercel.app',
+  'https://payment-dashboard-eight-rosy.vercel.app',
   'http://192.168.208.23:3000',
   'http://localhost:3000',
   'http://127.0.0.1:3000',
