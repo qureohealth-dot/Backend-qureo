@@ -95,6 +95,7 @@ const habitTrackerRoutes = require('./routes/habitTracker');
 const securitySettingsRoutes = require('./routes/securitySettings');
 const supportRoutes = require('./routes/support');
 const adminProvidersRoutes = require('./routes/adminProviders');
+const adminSystemHealthRoutes = require('./routes/adminSystemHealth');
 const campaignsRoutes = require('./routes/campaigns');
 const nearbyClinicsRoutes = require('./routes/nearbyClinics');
 const newsLetter = require('./routes/newsletter');
@@ -230,6 +231,7 @@ const allowedOrigins = [
   'https://qureo-lab.vercel.app',
   'https://qureodoctor.vercel.app',
   'https://qureohealth.vercel.app',
+  
   'https://qureodoctor.vercel.app',
   'https://payment-dashboard-eight-rosy.vercel.app',
   'http://192.168.208.23:3000',
@@ -385,6 +387,7 @@ app.use('/api/habit-tracker', habitTrackerRoutes);
 app.use('/api/security-settings', securitySettingsRoutes);
 app.use('/api/support', supportRoutes);
 app.use('/api/admin/providers', adminProvidersRoutes);
+app.use('/api/admin/system/health', adminSystemHealthRoutes);
 app.use('/api/campaigns', campaignsRoutes);
 app.use('/api/nearby-clinics', nearbyClinicsRoutes);
 app.use('/api/medicines', medicineRoutes);

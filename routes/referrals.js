@@ -2,6 +2,7 @@ const express = require('express');
 const crypto = require('crypto');
 const Referral = require('../models/Referral');
 const auth = require('../middleware/auth');
+const { requireAdmin } = require('../middleware/adminAuth');
 const sendEmail = require('../utils/email');
 
 const router = express.Router();
@@ -16,6 +17,22 @@ const normalizeEmails = (emails = []) => {
 const createInviteCode = () => {
   return `REF-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
 };
+
+router.get('/admin', auth, requireAdmin, async (req, res) => {
+  try {
+    const referrals = await Referral.find({})
+      .select('inviter inviteeEmail channel status emailSent acceptedAt createdAt updatedAt')
+      .populate('inviter', 'fullName email')
+      .sort({ createdAt: -1 })
+      .limit(500)
+      .lean();
+
+    return res.json({ referrals });
+  } catch (err) {
+    console.error('referrals/admin list error:', err);
+    return res.status(500).json({ message: 'Failed to fetch referrals' });
+  }
+});
 
 router.post('/invite', auth, async (req, res) => {
   try {

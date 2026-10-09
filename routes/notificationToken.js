@@ -2,10 +2,42 @@ const express = require("express");
 const NotificationToken  = require("../models/NotificationToken.js");
 const NotificationEvent = require("../models/NotificationEvent.js");
 const auth = require('../middleware/auth');
+const { requireAdmin } = require('../middleware/adminAuth');
 
 const router = express.Router();
 
 const resolveUserId = (req) => req.userId || req.body?.userId || req.query?.userId;
+
+router.get('/admin', auth, requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(Number.parseInt(req.query.limit, 10) || 100, 1), 200);
+    const [notifications, totalEvents, unreadEvents, registeredDevices, eventTypes] = await Promise.all([
+      NotificationEvent.find({})
+        .select('userId type title body read createdAt')
+        .populate('userId', 'fullName email')
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .lean(),
+      NotificationEvent.countDocuments({}),
+      NotificationEvent.countDocuments({ read: false }),
+      NotificationToken.countDocuments({}),
+      NotificationEvent.distinct('type'),
+    ]);
+
+    return res.json({
+      notifications,
+      summary: {
+        totalEvents,
+        unreadEvents,
+        registeredDevices,
+        eventTypes: eventTypes.length,
+      },
+    });
+  } catch (err) {
+    console.error('Error fetching admin notification feed:', err);
+    return res.status(500).json({ message: 'Failed to fetch notification activity' });
+  }
+});
 
 // 🔹 Save or update user's FCM token
 router.post("/save-token", auth, async (req, res) => {
