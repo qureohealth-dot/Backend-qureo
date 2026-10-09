@@ -10,6 +10,7 @@ const Doctor = require("../models/Doctor");
 const Profile = require("../models/Profile");
 const Prescription = require("../models/Prescription");
 const auth = require("../middleware/auth");
+const { requireAdmin } = require("../middleware/adminAuth");
 const doctorAuth = require('../middleware/doctorAuth');
 const moment = require("moment-timezone");
 const sendEmail = require("../utils/email");
@@ -300,6 +301,18 @@ const resolveDurationMinutes = (duration, durationMinutes) => {
   router.get("/", async (req, res) => {
     const result = await Consultation.find();
     res.json(result);
+  });
+
+  router.get("/admin", auth, requireAdmin, async (req, res) => {
+    try {
+      const consultations = await Consultation.find()
+        .sort({ appointmentTime: -1, createdAt: -1 })
+        .lean();
+      return res.json(consultations);
+    } catch (err) {
+      console.error("Failed to fetch admin consultations:", err);
+      return res.status(500).json({ message: "Failed to fetch consultations" });
+    }
   });
 
   // Create a new consultation
@@ -1313,4 +1326,3 @@ router.delete("/:id", auth, async (req, res) => {
 
 
 module.exports = router;
-
