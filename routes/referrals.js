@@ -21,8 +21,8 @@ const createInviteCode = () => {
 router.get('/admin', auth, requireAdmin, async (req, res) => {
   try {
     const referrals = await Referral.find({})
-      .select('inviter inviteeEmail channel status emailSent acceptedAt createdAt updatedAt')
-      .populate('inviter', 'fullName email')
+      .where('type').equals('clinical')
+      .select('type patientName patientEmail patientId referringProviderName receivingProviderName clinicalReason urgency appointmentAt supportingRecords outcome followUp followUpDueAt status createdBy createdAt updatedAt')
       .sort({ createdAt: -1 })
       .limit(500)
       .lean();
@@ -34,6 +34,70 @@ router.get('/admin', auth, requireAdmin, async (req, res) => {
   }
 });
 
+router.post('/admin', auth, requireAdmin, async (req, res) => {
+  try {
+    const patientName = String(req.body?.patientName || '').trim();
+    const patientEmail = String(req.body?.patientEmail || '').trim().toLowerCase();
+    const referringProviderName = String(req.body?.referringProviderName || '').trim();
+    const receivingProviderName = String(req.body?.receivingProviderName || '').trim();
+    const clinicalReason = String(req.body?.clinicalReason || '').trim();
+    const urgency = String(req.body?.urgency || 'routine').trim().toLowerCase();
+    const validUrgencies = ['routine', 'soon', 'urgent', 'emergency'];
+
+    if (!patientName || !referringProviderName || !receivingProviderName || !clinicalReason) {
+      return res.status(400).json({
+        message: 'Patient, referring provider, receiving provider, and clinical reason are required.',
+      });
+    }
+
+    if (patientEmail && !EMAIL_REGEX.test(patientEmail)) {
+      return res.status(400).json({ message: 'Enter a valid patient email address.' });
+    }
+
+    if (!validUrgencies.includes(urgency)) {
+      return res.status(400).json({ message: 'Urgency must be routine, soon, urgent, or emergency.' });
+    }
+
+    const parseDate = (value) => {
+      if (!value) return null;
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? undefined : date;
+    };
+    const appointmentAt = parseDate(req.body?.appointmentAt);
+    const followUpDueAt = parseDate(req.body?.followUpDueAt);
+    if (appointmentAt === undefined || followUpDueAt === undefined) {
+      return res.status(400).json({ message: 'Appointment and follow-up dates must be valid dates.' });
+    }
+
+    const supportingRecords = Array.isArray(req.body?.supportingRecords)
+      ? req.body.supportingRecords.map((record) => String(record || '').trim()).filter(Boolean).slice(0, 20)
+      : [];
+
+    const referral = await Referral.create({
+      type: 'clinical',
+      patientName,
+      patientEmail,
+      referringProviderName,
+      receivingProviderName,
+      clinicalReason,
+      urgency,
+      appointmentAt,
+      supportingRecords,
+      outcome: String(req.body?.outcome || '').trim(),
+      followUp: String(req.body?.followUp || '').trim(),
+      followUpDueAt,
+      status: 'created',
+      createdBy: String(req.userId || ''),
+    });
+
+    return res.status(201).json({ referral });
+  } catch (err) {
+    console.error('referrals/admin create error:', err);
+    return res.status(500).json({ message: 'Failed to create referral' });
+  }
+});
+
+/* Invite records remain separate from clinical referrals. */
 router.post('/invite', auth, async (req, res) => {
   try {
     const inviterId = req.userId;
@@ -76,6 +140,7 @@ router.post('/invite', auth, async (req, res) => {
       const inviteLink = `${appBase.replace(/\/$/, '')}/invite/${inviteCode}`;
 
       const referral = await Referral.create({
+        type: 'invite',
         inviter: inviterId,
         inviteeEmail: email,
         inviteCode,
