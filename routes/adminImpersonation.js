@@ -16,7 +16,7 @@ const SESSION_DURATION_MS = 15 * 60 * 1000;
 router.post('/start', auth, requireAdmin, async (req, res) => {
   const targetType = String(req.body?.targetType || '').trim().toLowerCase();
   const targetId = String(req.body?.targetId || '').trim();
-  const modelByType = { user: User, doctor: Doctor, pharmacy: Pharmacy, lab: Provider };
+  const modelByType = { user: User, doctor: Doctor, pharmacy: Pharmacy, lab: Provider, payment: Provider };
   const TargetModel = modelByType[targetType];
 
   if (!TargetModel || !targetId) {
@@ -59,7 +59,7 @@ router.post('/start', auth, requireAdmin, async (req, res) => {
       claims.id = String(target._id);
     }
 
-    const signingSecret = targetType === 'lab'
+    const signingSecret = targetType === 'lab' || targetType === 'payment'
       ? process.env.JWT_SECRET || 'supersecret123'
       : JWT_SECRET;
     const token = jwt.sign(claims, signingSecret, { expiresIn: '15m' });
