@@ -1,8 +1,10 @@
 const Newsletter = require("../models/Newletter");
 const express = require("express");
+const auth = require("../middleware/auth");
+const { requireAdmin } = require("../middleware/adminAuth");
 const router = express.Router();
 
-router.get("/", async (req, res) => {
+router.get("/", auth, requireAdmin, async (req, res) => {
     try {
         const newsletters = await Newsletter.find();
         res.json(newsletters);

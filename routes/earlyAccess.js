@@ -1,5 +1,7 @@
 const EarlyAccess = require("../models/EarlyAccess");
 const express = require("express");
+const auth = require("../middleware/auth");
+const { requireAdmin } = require("../middleware/adminAuth");
 const router = express.Router();
 const app = express.Router()
 app.use(express.json())
@@ -17,7 +19,7 @@ router.post("/", async (req, res) => {
     }
 });
 
-router.get("/return", async (req, res) => {
+router.get("/return", auth, requireAdmin, async (req, res) => {
     try {
         const earlyAccess = await EarlyAccess.find();
         res.json(earlyAccess);

@@ -24,6 +24,21 @@ const { notifyUser } = require('../utils/notifyUser');
 // Initialize cache (60 second TTL for health records, 5 min for AI insights)
 const healthRecordCache = new NodeCache({ stdTTL: 60 });
 const aiInsightCache = new NodeCache({ stdTTL: 300 });
+const WARNING_VITAL_REPEAT_MINUTES = Math.max(10, Number(process.env.WARNING_VITAL_REPEAT_MINUTES) || 30);
+const CRITICAL_VITAL_REPEAT_MINUTES = Math.max(5, Number(process.env.CRITICAL_VITAL_REPEAT_MINUTES) || 10);
+
+const latestMeasurement = (entries) => {
+  if (!Array.isArray(entries) || entries.length === 0) return null;
+  return entries.reduce((latest, entry) => {
+    if (!latest) return entry;
+    return new Date(entry?.measuredAt || 0) >= new Date(latest?.measuredAt || 0) ? entry : latest;
+  }, null);
+};
+
+const readingValue = (entries) => {
+  const entry = latestMeasurement(entries);
+  return entry && Number.isFinite(Number(entry.value)) ? Number(entry.value) : null;
+};
 
 class HealthMonitoringService {
   /**
@@ -122,20 +137,33 @@ class HealthMonitoringService {
 
       await this.sendTodayCarePlanPush(userId, { medications, vitals, healthRecords });
 
+      // Repeat abnormal-vital alerts on a controlled cadence, not every check cycle.
+      const alertsToCreate = [];
+      for (const alert of alerts) {
+        if (alert.type !== 'vital_abnormal') {
+          alertsToCreate.push(alert);
+          continue;
+        }
+        const keyedAlert = alert.data?.alertKey
+          ? alert
+          : { ...alert, data: { ...alert.data, alertKey: `title:${String(alert.title || 'abnormal-vital').toLowerCase()}` } };
+        if (await this.shouldRepeatVitalAlert(userId, keyedAlert)) alertsToCreate.push(keyedAlert);
+      }
+
       // STEP 8: SAVE ALERTS TO DATABASE (BULK OPERATION)
-      if (alerts.length > 0) {
-        await HealthAlert.insertMany(alerts.map(alert => ({ ...alert, user: userId })));
-        console.log(`✅ Created ${alerts.length} alerts for user ${userId}`);
+      if (alertsToCreate.length > 0) {
+        const savedAlerts = await HealthAlert.insertMany(alertsToCreate.map(alert => ({ ...alert, user: userId })));
+        console.log(`✅ Created ${savedAlerts.length} alerts for user ${userId}`);
 
         // Send notifications asynchronously (non-blocking)
-        for (const alert of alerts) {
+        for (const alert of savedAlerts) {
           this.sendNotification(userId, alert).catch(err => 
             console.error('Notification error:', err.message)
           );
         }
       }
 
-      return alerts;
+      return alertsToCreate;
     } catch (error) {
       console.error(`❌ Error analyzing user health ${userId}:`, error.message);
       return [];
@@ -220,7 +248,7 @@ class HealthMonitoringService {
   static async fetchLatestVitalsOptimized(userId) {
     try {
       const latestVitals = await Vitals.findOne({ user: userId })
-        .select('bloodPressure heartRate temperature oxygenLevel weight symptoms hydration createdAt')
+        .select('bloodPressure heartRate temperature oxygenLevel bloodSugar weight symptoms hydration createdAt')
         .sort({ createdAt: -1 })
         .lean();
 
@@ -240,14 +268,20 @@ class HealthMonitoringService {
         .sort({ createdAt: -1 })
         .lean();
 
+      const bloodPressure = latestMeasurement(latestVitals.bloodPressure);
+      const bloodSugar = latestMeasurement(latestVitals.bloodSugar);
+
       return {
         current: {
-          bp: latestVitals.bloodPressure?.raw || 'N/A',
-          hr: latestVitals.heartRate,
-          temp: latestVitals.temperature,
-          o2: latestVitals.oxygenLevel,
-          weight: latestVitals.weight,
-          hydration: latestVitals.hydration,
+          bp: bloodPressure?.raw || (bloodPressure?.systolic != null && bloodPressure?.diastolic != null
+            ? `${bloodPressure.systolic}/${bloodPressure.diastolic}`
+            : 'N/A'),
+          hr: readingValue(latestVitals.heartRate),
+          temp: readingValue(latestVitals.temperature),
+          o2: readingValue(latestVitals.oxygenLevel),
+          bloodSugar: bloodSugar ? { value: Number(bloodSugar.value), unit: bloodSugar.unit || 'mg/dL' } : null,
+          weight: readingValue(latestVitals.weight),
+          hydration: readingValue(latestVitals.hydration),
           symptoms: latestVitals.symptoms || [],
           timestamp: latestVitals.createdAt,
         },
@@ -326,12 +360,17 @@ class HealthMonitoringService {
         o2: { min: 95, max: 100 },
       };
 
+      const pushAlert = (alertKey, alert) => alerts.push({
+        ...alert,
+        data: { ...alert.data, alertKey },
+      });
+
       // Blood Pressure Check
       if (current.bp && current.bp !== 'N/A') {
         const [sys, dia] = current.bp.split('/').map(Number);
 
         if (sys > 140 || dia > 90) {
-          alerts.push({
+          pushAlert('blood-pressure-high', {
             type: 'vital_abnormal',
             title: '⚠️ High Blood Pressure Detected',
             message: `Your blood pressure is ${current.bp} mmHg, which is elevated. This may require attention.`,
@@ -344,7 +383,7 @@ class HealthMonitoringService {
             notificationType: 'push',
           });
         } else if (sys < 90 || dia < 60) {
-          alerts.push({
+          pushAlert('blood-pressure-low', {
             type: 'vital_abnormal',
             title: '⚠️ Low Blood Pressure Detected',
             message: `Your blood pressure is ${current.bp} mmHg, which is low.`,
@@ -362,7 +401,7 @@ class HealthMonitoringService {
       // Heart Rate Check
       if (current.hr) {
         if (current.hr > 120) {
-          alerts.push({
+          pushAlert('heart-rate-high', {
             type: 'vital_abnormal',
             title: '⚠️ Elevated Heart Rate',
             message: `Your heart rate is ${current.hr} bpm, which is elevated. Possible causes: exercise, stress, or health concerns.`,
@@ -375,7 +414,7 @@ class HealthMonitoringService {
             notificationType: 'push',
           });
         } else if (current.hr < 50) {
-          alerts.push({
+          pushAlert('heart-rate-low', {
             type: 'vital_abnormal',
             title: '⚠️ Low Heart Rate',
             message: `Your heart rate is ${current.hr} bpm, which is low.`,
@@ -393,7 +432,7 @@ class HealthMonitoringService {
       // Temperature Check
       if (current.temp) {
         if (current.temp > 99.5) {
-          alerts.push({
+          pushAlert('temperature-high', {
             type: 'vital_abnormal',
             title: '🌡️ Fever Detected',
             message: `Your temperature is ${current.temp}°F, indicating a fever. This may suggest an infection.`,
@@ -406,7 +445,7 @@ class HealthMonitoringService {
             notificationType: 'push',
           });
         } else if (current.temp < 95) {
-          alerts.push({
+          pushAlert('temperature-low', {
             type: 'vital_abnormal',
             title: '❄️ Low Temperature',
             message: `Your temperature is ${current.temp}°F, which is low.`,
@@ -424,7 +463,7 @@ class HealthMonitoringService {
       // Oxygen Level Check
       if (current.o2) {
         if (current.o2 < 95) {
-          alerts.push({
+          pushAlert('oxygen-low', {
             type: 'vital_abnormal',
             title: '🫁 Low Oxygen Saturation',
             message: `Your oxygen level is ${current.o2}%, which is below normal. This needs immediate attention.`,
@@ -439,11 +478,87 @@ class HealthMonitoringService {
         }
       }
 
+      const bloodSugar = current.bloodSugar;
+      if (bloodSugar && Number.isFinite(Number(bloodSugar.value))) {
+        const value = Number(bloodSugar.value);
+        const mmol = bloodSugar.unit === 'mmol/L';
+        const lowThreshold = mmol ? 3.0 : 54;
+        const lowWarningThreshold = mmol ? 3.9 : 70;
+        const highWarningThreshold = mmol ? 11.1 : 200;
+        const highCriticalThreshold = mmol ? 16.7 : 300;
+        if (value < lowThreshold) {
+          pushAlert('blood-sugar-low-critical', {
+            type: 'vital_abnormal',
+            title: '⚠️ Very Low Blood Sugar',
+            message: `Your blood sugar is ${value} ${bloodSugar.unit}, which is very low.`,
+            severity: 'critical',
+            data: {
+              abnormalReading: `Blood sugar: ${value} ${bloodSugar.unit} (VERY LOW)`,
+              recommendation: 'Follow your clinician-provided low blood sugar plan and seek urgent help if you feel confused, faint, or severely unwell.',
+            },
+            notificationType: 'push',
+          });
+        } else if (value < lowWarningThreshold) {
+          pushAlert('blood-sugar-low', {
+            type: 'vital_abnormal',
+            title: '⚠️ Low Blood Sugar',
+            message: `Your blood sugar is ${value} ${bloodSugar.unit}, which is below the expected range.`,
+            severity: 'warning',
+            data: {
+              abnormalReading: `Blood sugar: ${value} ${bloodSugar.unit} (LOW)`,
+              recommendation: 'Follow your clinician-provided guidance and recheck as advised.',
+            },
+            notificationType: 'push',
+          });
+        } else if (value >= highCriticalThreshold) {
+          pushAlert('blood-sugar-high-critical', {
+            type: 'vital_abnormal',
+            title: '⚠️ Very High Blood Sugar',
+            message: `Your blood sugar is ${value} ${bloodSugar.unit}, which is very high.`,
+            severity: 'critical',
+            data: {
+              abnormalReading: `Blood sugar: ${value} ${bloodSugar.unit} (VERY HIGH)`,
+              recommendation: 'Follow your clinician-provided high blood sugar plan and seek medical advice promptly, especially if you feel unwell.',
+            },
+            notificationType: 'push',
+          });
+        } else if (value >= highWarningThreshold) {
+          pushAlert('blood-sugar-high', {
+            type: 'vital_abnormal',
+            title: '⚠️ High Blood Sugar',
+            message: `Your blood sugar is ${value} ${bloodSugar.unit}, which is above the expected range.`,
+            severity: 'warning',
+            data: {
+              abnormalReading: `Blood sugar: ${value} ${bloodSugar.unit} (HIGH)`,
+              recommendation: 'Follow your clinician-provided guidance and recheck as advised.',
+            },
+            notificationType: 'push',
+          });
+        }
+      }
+
       return alerts;
     } catch (error) {
       console.error('Error checking vital readings:', error);
       return [];
     }
+  }
+
+  static async shouldRepeatVitalAlert(userId, alert, now = new Date()) {
+    const previousAlertQuery = {
+      user: userId,
+      type: 'vital_abnormal',
+      'data.alertKey': alert.data.alertKey,
+    };
+    if (alert.severity === 'critical') previousAlertQuery.severity = 'critical';
+    const previousAlert = await HealthAlert.findOne(previousAlertQuery)
+      .sort({ createdAt: -1 }).select('createdAt').lean();
+
+    if (!previousAlert) return true;
+    const intervalMinutes = alert.severity === 'critical'
+      ? CRITICAL_VITAL_REPEAT_MINUTES
+      : WARNING_VITAL_REPEAT_MINUTES;
+    return now.getTime() - new Date(previousAlert.createdAt).getTime() >= intervalMinutes * 60 * 1000;
   }
 
   /**

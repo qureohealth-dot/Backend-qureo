@@ -895,8 +895,12 @@ router.post('/pay-provider', auth, async (req, res) => {
         pharmacyWallet.lastTransaction = new Date();
         await pharmacyWallet.save({ session });
       } else {
-        wallet2 = await Wallet.findOne({ user: providerId }).session(session);
-        if (!wallet2) throw new Error('Provider wallet not found');
+        wallet2 = await Wallet.findOneAndUpdate(
+          { user: providerId },
+          { $setOnInsert: { balance: 0, currency: 'USD', status: 'active' } },
+          { upsert: true, new: true, setDefaultsOnInsert: true, session }
+        );
+        if (wallet2.status !== 'active') throw new Error('Provider wallet is not active');
         const providerPreviousBalance = wallet2.balance;
         providerNewBalance = providerPreviousBalance + paymentAmount;
         wallet2.balance = providerNewBalance;

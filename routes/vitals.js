@@ -5,6 +5,22 @@ const HealthAlert = require('../models/HealthAlert');
 const HealthMonitoringServiceEnhanced = require('../services/HealthMonitoringServiceEnhanced');
 const auth = require('../middleware/auth');
 
+const notifyForCurrentAbnormalVitals = async (userId) => {
+  try {
+    const latestReadings = await HealthMonitoringServiceEnhanced.fetchLatestVitalsOptimized(userId);
+    const vitalAlerts = await HealthMonitoringServiceEnhanced.checkVitalReadings(userId, latestReadings);
+    for (const alert of vitalAlerts) {
+      if (!await HealthMonitoringServiceEnhanced.shouldRepeatVitalAlert(userId, alert)) continue;
+      const savedAlert = await HealthAlert.create({ ...alert, user: userId });
+      HealthMonitoringServiceEnhanced.sendNotification(userId, savedAlert).catch((notificationError) => {
+        console.error('Immediate abnormal-vitals notification failed:', notificationError?.message || notificationError);
+      });
+    }
+  } catch (alertError) {
+    console.error('Immediate abnormal-vitals check failed:', alertError?.message || alertError);
+  }
+};
+
 // Utility
 const toDayKey = (date) => new Date(date).toISOString().slice(0, 10);
 
@@ -134,6 +150,7 @@ router.post('/', auth, async (req, res) => {
     }
 
     await vitals.save();
+    await notifyForCurrentAbnormalVitals(userId);
 
     res.status(201).json({ message: 'Vitals recorded successfully', vitals });
   } catch (err) {
@@ -194,6 +211,7 @@ router.put('/:id', auth, async (req, res) => {
     }
 
     await vitals.save();
+    await notifyForCurrentAbnormalVitals(userId);
     res.json({ message: 'Vitals updated successfully', vitals });
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });

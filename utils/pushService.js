@@ -244,7 +244,6 @@ async function sendPushToToken(token, title, body, data = {}) {
 
     const androidNotification = {
       channelId: 'qureo-alerts',
-      clickAction: 'FLUTTER_NOTIFICATION_CLICK',
       sound: shouldRing ? 'qureo_alarm' : 'default',
       visibility: 'public',
     };
@@ -335,7 +334,6 @@ async function sendPushToMultipleTokens(tokens, title, body, data = {}) {
 
     const androidNotification = {
       channelId: 'qureo-alerts',
-      clickAction: 'FLUTTER_NOTIFICATION_CLICK',
     };
 
 androidNotification.sound = shouldRing
