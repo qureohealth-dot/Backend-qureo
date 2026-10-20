@@ -164,7 +164,7 @@ router.put("/:id/status", labProviderAuth, async (req, res) => {
           balancedBody: 'Your lab booking status has changed.',
           genericTitle: 'You have a new update in Qureo',
           genericBody: 'Open Qureo to view your latest lab update.',
-          route: '/notification',
+          route: `/booking-details/${booking._id}`,
           data: {
             bookingId: String(booking._id),
             status: String(status || ''),
@@ -246,7 +246,7 @@ router.put("/:bookingId/test/:testId/result", labProviderAuth, async (req, res) 
         balancedBody: 'A lab test result has been updated.',
         genericTitle: 'You have a new update in Qureo',
         genericBody: 'Open Qureo to view your latest lab update.',
-        route: '/notification',
+          route: `/booking-details/${booking._id}`,
         data: {
           bookingId: String(booking._id),
           testId: String(test._id),

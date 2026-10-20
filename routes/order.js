@@ -7,6 +7,7 @@ const Pharmacy = require('../models/Pharmacy');
 const Transaction = require('../models/Transaction');
 const auth = require('../middleware/auth');
 const mongoose = require('mongoose');
+const { notifyUser } = require('../utils/notifyUser');
 
 const getIO = () => {
   try {
@@ -133,12 +134,11 @@ router.get('/:id', auth, async (req, res) => {
 router.patch('/:id/status', async (req, res) => {
   try {
     const { status } = req.body;
-    const order = await Order.findByIdAndUpdate(
-      req.params.id,
-      { status },
-      { new: true }
-    );
+    const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ message: 'Order not found' });
+    const previousStatus = order.status;
+    order.status = status;
+    await order.save();
 
     // Emit real-time delivery update to the patient
     try {
@@ -152,6 +152,25 @@ router.patch('/:id/status', async (req, res) => {
       }
     } catch (emitErr) {
       console.error('Failed to emit orderDeliveryUpdate:', emitErr.message);
+    }
+
+    if (previousStatus !== order.status && order.user) {
+      try {
+        await notifyUser({
+          userId: order.user,
+          type: 'order_status_updated',
+          title: 'Pharmacy order updated',
+          body: `Your order status changed to ${order.status}.`,
+          balancedTitle: 'Pharmacy order updated',
+          balancedBody: `Your order status changed to ${order.status}.`,
+          genericTitle: 'Your pharmacy order was updated',
+          genericBody: 'Open Qureo to check your latest order update.',
+          route: '/orders',
+          data: { orderId: String(order._id), status: String(order.status || '') },
+        });
+      } catch (notifyError) {
+        console.warn('[orders] status push failed:', notifyError?.message || notifyError);
+      }
     }
 
     res.json(order);

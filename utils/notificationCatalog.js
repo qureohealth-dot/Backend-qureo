@@ -73,6 +73,7 @@ const NOTIFICATION_TYPE_MAP = {
   pharmacy_delivery_update: { category: 'pharmacy' },
   pharmacy_medication_time: { category: 'pharmacy' },
   pharmacy_refill_reminder: { category: 'pharmacy' },
+  order_status_updated: { category: 'pharmacy' },
 
   lab_booking_created: { category: 'lab_services' },
   lab_booking_status_updated: { category: 'lab_services' },
