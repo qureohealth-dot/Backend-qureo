@@ -239,6 +239,9 @@ router.post('/phone/send-code', auth, async (req, res) => {
       sent: true,
       status: result.status,
       phone: result.to,
+      ...(result.provider === 'dev-fallback' && result.developmentCode
+        ? { developmentCode: result.developmentCode }
+        : {}),
     });
   } catch (err) {
     const status = err?.code === 'INVALID_PHONE' ? 400 : 502;

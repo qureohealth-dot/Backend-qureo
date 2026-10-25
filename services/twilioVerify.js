@@ -11,6 +11,7 @@ const hasTwilioConfig =
 
 const devOtpStore = new Map();
 const DEV_OTP_TTL_MS = 10 * 60 * 1000;
+const DEV_OTP_CODE = "123456";
 
 const twilioClient = hasTwilioConfig
   ? twilio(ACCOUNT_SID, AUTH_TOKEN)
@@ -28,12 +29,6 @@ function isValidE164(phone) {
 
 function getDevKey(phone, userId) {
   return `${userId || "anonymous"}::${phone}`;
-}
-
-function generateOtpCode() {
-  return String(
-    Math.floor(100000 + Math.random() * 900000)
-  );
 }
 
 /**
@@ -91,7 +86,11 @@ async function sendOtp({
   /**
    * DEV FALLBACK
    */
-  const code = generateOtpCode();
+  if (process.env.NODE_ENV === "production") {
+    const err = new Error("Phone verification is not configured.");
+    err.code = "OTP_PROVIDER_NOT_CONFIGURED";
+    throw err;
+  }
 
   const key = getDevKey(
     normalizedPhone,
@@ -99,13 +98,9 @@ async function sendOtp({
   );
 
   devOtpStore.set(key, {
-    code,
+    code: DEV_OTP_CODE,
     expiresAt: Date.now() + DEV_OTP_TTL_MS,
   });
-
-  console.log(
-    `🔐 DEV OTP for ${normalizedPhone}: ${code}`
-  );
 
   return {
     provider: "dev-fallback",
@@ -113,6 +108,7 @@ async function sendOtp({
     status: "pending",
     channel,
     to: normalizedPhone,
+    developmentCode: DEV_OTP_CODE,
   };
 }
 
@@ -179,6 +175,12 @@ async function verifyOtp({
   /**
    * DEV FALLBACK
    */
+  if (process.env.NODE_ENV === "production") {
+    const err = new Error("Phone verification is not configured.");
+    err.code = "OTP_PROVIDER_NOT_CONFIGURED";
+    throw err;
+  }
+
   const key = getDevKey(
     normalizedPhone,
     userId
