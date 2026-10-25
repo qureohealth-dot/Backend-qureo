@@ -16,6 +16,11 @@ const moment = require("moment-timezone");
 const sendEmail = require("../utils/email");
 const sendSMS = require("../utils/sms");
 const { notifyUser } = require("../utils/notifyUser");
+const {
+  getDoctorAcceptanceStatuses,
+  canDoctorAcceptConsultation,
+  nextConsultationStatusAfterAcceptance,
+} = require("../lib/consultationStatus");
 
 const JWT_SECRET =
   process.env.JWT_SECRET ||
@@ -390,7 +395,7 @@ const resolveDurationMinutes = (duration, durationMinutes) => {
         durationMinutes: resolvedDurationMinutes,
         reason,
         roomId,
-        status: "pending",
+        status: "awaiting_confirmation",
         paymentTransaction: paymentTransaction?._id || null,
         paidAmount: paymentTransaction ? Number(paymentTransaction.amount) : 0,
         bookingPaymentReference: bookingPaymentReference ? String(bookingPaymentReference) : null,
@@ -416,20 +421,20 @@ const resolveDurationMinutes = (duration, durationMinutes) => {
         notifyUser({
           userId: doctor,
           type: 'consultation_request',
-          title: 'New consultation request',
-          body: `A patient requested a consultation for ${appointmentLabel}.`,
-          balancedTitle: 'New consultation request',
+          title: 'New consultation awaiting confirmation',
+          body: `A patient requested a consultation for ${appointmentLabel}. Please confirm or decline.`,
+          balancedTitle: 'Consultation awaiting confirmation',
           balancedBody: `Review and confirm or reschedule the consultation for ${appointmentLabel}.`,
-          genericTitle: 'New consultation request',
-          genericBody: 'Open the doctor portal to review the request.',
+          genericTitle: 'Consultation awaiting confirmation',
+          genericBody: 'Open the doctor portal to review and confirm the request.',
           route: '/dashboard/consultations',
           data: { consultationId: String(consultation._id), status: consultation.status },
         }),
         notifyUser({
           userId: patient,
-          type: 'consultation_pending',
+          type: 'consultation_awaiting_confirmation',
           title: 'Consultation request sent',
-          body: `Your consultation with ${doctorName} for ${appointmentLabel} is awaiting confirmation.`,
+          body: `Your consultation with ${doctorName} for ${appointmentLabel} is awaiting doctor confirmation.`,
           balancedTitle: 'Consultation awaiting confirmation',
           balancedBody: `Your consultation with ${doctorName} is awaiting confirmation.`,
           genericTitle: 'Consultation request sent',
@@ -851,11 +856,11 @@ router.put('/:id/confirm', doctorAuth, async (req, res) => {
       return res.status(403).json({ message: 'Only assigned doctor can confirm this booking' });
     }
 
-    if (!['pending', 'scheduled'].includes(consultation.status)) {
-      return res.status(400).json({ message: 'Only pending consultations can be confirmed' });
+    if (!canDoctorAcceptConsultation(consultation.status)) {
+      return res.status(400).json({ message: 'Only awaiting confirmation, pending, or scheduled consultations can be accepted' });
     }
 
-    consultation.status = 'confirmed';
+    consultation.status = nextConsultationStatusAfterAcceptance(consultation.status);
     consultation.confirmedByDoctorId = req.doctorId;
     consultation.confirmedAt = new Date();
     consultation.updatedAt = new Date();
@@ -891,8 +896,8 @@ router.put('/:id/reject', doctorAuth, async (req, res) => {
     if (String(consultation.doctor) !== req.doctorId) {
       return res.status(403).json({ message: 'Only the assigned doctor can reject this consultation' });
     }
-    if (!['pending', 'scheduled'].includes(consultation.status)) {
-      return res.status(400).json({ message: 'Only pending consultations can be rejected' });
+    if (!['awaiting_confirmation', 'pending', 'scheduled'].includes(consultation.status)) {
+      return res.status(400).json({ message: 'Only awaiting confirmation or pending consultations can be rejected' });
     }
 
     const originalPayment = consultation.paymentTransaction

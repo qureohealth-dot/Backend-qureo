@@ -28,8 +28,8 @@ const consultationSchema = new mongoose.Schema({
   roomId: { type: String, required: true, unique: true },
   status: {
     type: String,
-    enum: ["scheduled", "ongoing", "pending", "confirmed", "cancelled", "completed", "no_show"],
-    default: "scheduled",
+    enum: ["awaiting_confirmation", "scheduled", "ongoing", "pending", "confirmed", "cancelled", "completed", "no_show"],
+    default: "awaiting_confirmation",
   },
   notified30min: { type: Boolean, default: false },
   notifiedBefore: { type: Boolean, default: false },
