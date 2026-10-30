@@ -566,8 +566,24 @@ const MONGO_URI = process.env.MONGO_URI || "mongodb+srv://edwardsyambasu_db_user
 mongoose.connect(MONGO_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
-}).then(() => {
+}).then(async () => {
   console.log('✅ Connected to MongoDB');
+
+  const userIndexes = await User.collection.indexes().catch((error) => {
+    if (error.code === 26 || error.codeName === 'NamespaceNotFound') return [];
+    throw error;
+  });
+  const legacyUserIdIndex = userIndexes.find((index) =>
+    index.name === 'id_1' && index.key?.id === 1 && index.unique === true
+  );
+  if (legacyUserIdIndex) {
+    try {
+      await User.collection.dropIndex('id_1');
+      console.warn('Removed obsolete unique users.id index before starting the API.');
+    } catch (error) {
+      if (error.code !== 27 && error.codeName !== 'IndexNotFound') throw error;
+    }
+  }
   
   // Start Health Monitoring Scheduler after DB connection
   console.log('\n🏥 Initializing Health Monitoring System...');
