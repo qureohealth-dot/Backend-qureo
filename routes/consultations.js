@@ -16,6 +16,7 @@ const moment = require("moment-timezone");
 const sendEmail = require("../utils/email");
 const sendSMS = require("../utils/sms");
 const { notifyUser } = require("../utils/notifyUser");
+const { refundConsultationPayment } = require('../services/refundConsultationPayment');
 const {
   getDoctorAcceptanceStatuses,
   canDoctorAcceptConsultation,
@@ -926,94 +927,25 @@ router.put('/:id/reject', doctorAuth, async (req, res) => {
           'metadata.consultationBookingReference': consultation.bookingPaymentReference,
         })
         : null;
-    let refundStatus = 'unavailable';
-
+    let refundStatus;
     if (originalPayment?.status === 'completed') {
-      const session = await mongoose.startSession();
-      session.startTransaction();
       try {
-        const payment = await Transaction.findOne({
-          _id: originalPayment._id,
-          user: consultation.patient,
-          status: 'completed',
-        }).session(session);
-        if (!payment || payment.type !== 'consultation' || Number(payment.amount) <= 0) {
-          throw new Error('Original consultation payment is not refundable');
-        }
-
-        const existingRefund = await Transaction.findOne({ refundOf: payment._id }).session(session);
-        if (existingRefund) {
-          refundStatus = 'completed';
-        } else {
-          const [patientWallet, recipientWallet] = await Promise.all([
-            Wallet.findOneAndUpdate(
-              { user: payment.user },
-              { $setOnInsert: { balance: 0, currency: 'USD', status: 'active' } },
-              { upsert: true, new: true, setDefaultsOnInsert: true, session }
-            ),
-            payment.provider
-              ? Wallet.findOneAndUpdate(
-                  { user: payment.provider },
-                  { $setOnInsert: { balance: 0, currency: 'USD', status: 'active' } },
-                  { upsert: true, new: true, setDefaultsOnInsert: true, session }
-                )
-              : null,
-          ]);
-          if (!patientWallet) {
-            throw new Error('Patient wallet not found for consultation refund');
-          }
-          const amount = Number(payment.amount);
-          const patientPreviousBalance = Number(patientWallet.balance || 0);
-          patientWallet.balance = patientPreviousBalance + amount;
-          patientWallet.totalDeposits = Number(patientWallet.totalDeposits || 0) + amount;
-          patientWallet.lastTransaction = new Date();
-          const walletUpdates = [patientWallet.save({ session })];
-          if (recipientWallet) {
-            recipientWallet.balance = Number(recipientWallet.balance || 0) - amount;
-            recipientWallet.totalWithdrawals = Number(recipientWallet.totalWithdrawals || 0) + amount;
-            recipientWallet.lastTransaction = new Date();
-            walletUpdates.push(recipientWallet.save({ session }));
-          }
-          await Promise.all(walletUpdates);
-
-          await Transaction.create([{
-            wallet: patientWallet._id,
-            user: payment.user,
-            provider: payment.provider,
-            type: 'refund',
-            amount,
-            previousBalance: patientPreviousBalance,
-            newBalance: patientWallet.balance,
-            status: 'completed',
-            paymentMethod: 'wallet',
-            description: `Refund for rejected consultation ${consultation._id}`,
-            reference: `CONSULTATION-REFUND-${payment._id}`,
-            refundOf: payment._id,
-            metadata: { consultationId: String(consultation._id) },
-            completedAt: new Date(),
-          }], { session });
-          refundStatus = 'completed';
-        }
-
-        consultation.status = 'cancelled';
-        consultation.rejectionReason = String(req.body?.reason || 'Doctor unavailable').trim().slice(0, 500);
-        consultation.refundStatus = refundStatus;
-        consultation.updatedAt = new Date();
-        await consultation.save({ session });
-        await session.commitTransaction();
+        refundStatus = await refundConsultationPayment({
+          consultation,
+          payment: originalPayment,
+          reason: req.body?.reason,
+        });
       } catch (error) {
-        await session.abortTransaction();
         if (error?.code === 11000) {
           return res.status(409).json({ message: 'This consultation refund has already been processed' });
         }
         throw error;
-      } finally {
-        await session.endSession();
       }
     } else {
+      refundStatus = 'unavailable';
       consultation.status = 'cancelled';
       consultation.rejectionReason = String(req.body?.reason || 'Doctor unavailable').trim().slice(0, 500);
-      consultation.refundStatus = 'unavailable';
+      consultation.refundStatus = refundStatus;
       consultation.updatedAt = new Date();
       await consultation.save();
     }
@@ -1067,64 +999,8 @@ router.put('/:id/no-show', doctorAuth, async (req, res) => {
   }
 });
 
-// Reschedule consultation
-router.put("/:id/reschedule", doctorAuth, async (req, res) => {
-  try {
-    const { appointmentTime } = req.body;
-    const newAppointmentTime = new Date(appointmentTime);
-    if (!appointmentTime || Number.isNaN(newAppointmentTime.getTime()) || newAppointmentTime <= new Date()) {
-      return res.status(400).json({ message: "Choose a valid future appointment time" });
-    }
-    const existing = await Consultation.findById(req.params.id);
-    if (!existing) {
-      return res.status(404).json({ message: "Consultation not found" });
-    }
-    if (String(existing.doctor) !== req.doctorId) {
-      return res.status(403).json({ message: "Only the assigned doctor can reschedule this consultation" });
-    }
-    if (!['pending', 'scheduled', 'confirmed'].includes(existing.status)) {
-      return res.status(400).json({ message: "Only upcoming consultations can be rescheduled" });
-    }
-
-    const doctor = await Doctor.findById(req.doctorId).select('availability').lean();
-    const hasDoctorSchedule = Object.values(doctor?.availability || {}).some((slots) => Array.isArray(slots) && slots.length > 0);
-    if ((existing.mode === 'in-person' || hasDoctorSchedule) && !isSlotAvailableFromDoctorSchedule(doctor, newAppointmentTime)) {
-      return res.status(400).json({ message: "New time is outside your availability" });
-    }
-
-    const conflict = await Consultation.findOne({
-      _id: { $ne: existing._id },
-      doctor: req.doctorId,
-      appointmentTime: newAppointmentTime,
-      status: { $in: STATUS_ACTIVE_FOR_CONFLICT },
-    }).lean();
-    if (conflict) return res.status(409).json({ message: "That appointment time is already booked" });
-
-    existing.appointmentTime = newAppointmentTime;
-    existing.status = 'pending';
-    existing.confirmedByDoctorId = null;
-    existing.confirmedAt = null;
-    existing.notified30min = false;
-    existing.notifiedBefore = false;
-    existing.notifiedStart = false;
-    existing.updatedAt = new Date();
-    const consultation = await existing.save();
-    await notifyUser({
-      userId: consultation.patient,
-      type: 'consultation_rescheduled',
-      title: 'Consultation time changed',
-      body: `Your doctor proposed a new time: ${newAppointmentTime.toLocaleString()}. Please confirm the updated appointment.`,
-      balancedTitle: 'Consultation rescheduled',
-      balancedBody: `Your consultation has been moved to ${newAppointmentTime.toLocaleString()} and is awaiting confirmation.`,
-      genericTitle: 'Consultation time changed',
-      genericBody: 'Your doctor proposed a new consultation time.',
-      route: '/appoint',
-      data: { consultationId: String(consultation._id), status: consultation.status },
-    });
-    res.json(consultation);
-  } catch (err) {
-    res.status(500).json({ message: "Failed to reschedule consultation", error: err.message });
-  }
+router.put('/:id/reschedule', doctorAuth, (req, res) => {
+  return res.status(403).json({ message: 'Doctors cannot reschedule consultations. Ask the patient to cancel and book a new time.' });
 });
 
 // Mark consultation completed (used when paid time expires in call room)

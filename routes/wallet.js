@@ -59,6 +59,21 @@ const SOURCE_TO_BUCKET = {
   family_support: 'familySupport',
 };
 
+const QUREO_CATALOG_SELLER = 'qureo pharmacy';
+const QUREO_GENERAL_PROVIDER_NAME = 'QUREO GENERAL DASHBOARD';
+
+const resolveQureoGeneralProvider = async () => {
+  const configuredId = process.env.QUREO_GENERAL_PROVIDER_ID;
+  if (configuredId && mongoose.isValidObjectId(configuredId)) {
+    const configuredProvider = await Provider.findById(configuredId);
+    if (configuredProvider) return configuredProvider;
+  }
+
+  return Provider.findOne({
+    name: { $regex: `^${QUREO_GENERAL_PROVIDER_NAME.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' },
+  });
+};
+
 const normalizeVoucherCode = (value) => String(value || '').trim().toUpperCase();
 const normalizeSupportCategories = (categories = []) => {
   const list = Array.isArray(categories) ? categories : [];
@@ -789,6 +804,8 @@ router.post('/pay-provider', auth, async (req, res) => {
     }
 
     let pharmacy = null;
+    let qureoCatalogProvider = null;
+    let isQureoGeneralOrder = false;
     let pharmacyCart = null;
     let pharmacySubtotal = 0;
     let paymentAmount = Number(amount);
@@ -798,22 +815,39 @@ router.post('/pay-provider', auth, async (req, res) => {
         return res.status(400).json({ error: 'Your medicine cart is empty' });
       }
 
-      pharmacy = mongoose.isValidObjectId(pharmacyId)
-        ? await Pharmacy.findById(pharmacyId)
-        : await Pharmacy.findOne({ name: { $regex: `^${String(pharmacyId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' } });
+      const sellerNames = [...new Set(pharmacyCart.items.map((item) =>
+        String(item.medicine?.pharmacy || '').trim().toLowerCase()
+      ))];
+      isQureoGeneralOrder =
+        String(pharmacyId).trim().toLowerCase() === QUREO_CATALOG_SELLER &&
+        sellerNames.length === 1 && sellerNames[0] === QUREO_CATALOG_SELLER;
 
-      if (!pharmacy) {
-        return res.status(404).json({
-          code: 'PHARMACY_NOT_FOUND',
-          error: `The pharmacy "${String(pharmacyId).trim()}" for this medicine is not registered to receive orders.`,
-        });
-      }
-      if (!pharmacyCart.items.every((item) => {
-        if (!item.medicine) return false;
-        const owner = String(item.medicine?.pharmacy || '').trim();
-        return owner.toLowerCase() === pharmacy.name.trim().toLowerCase() || owner === String(pharmacy._id);
-      })) {
-        return res.status(400).json({ error: 'All medicines in the cart must belong to the selected pharmacy' });
+      if (isQureoGeneralOrder) {
+        qureoCatalogProvider = await resolveQureoGeneralProvider();
+        if (!qureoCatalogProvider) {
+          return res.status(404).json({
+            code: 'QUREO_GENERAL_PROVIDER_NOT_FOUND',
+            error: `The ${QUREO_GENERAL_PROVIDER_NAME} provider account is not configured to receive Qureo catalog orders.`,
+          });
+        }
+      } else {
+        pharmacy = mongoose.isValidObjectId(pharmacyId)
+          ? await Pharmacy.findById(pharmacyId)
+          : await Pharmacy.findOne({ name: { $regex: `^${String(pharmacyId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' } });
+
+        if (!pharmacy) {
+          return res.status(404).json({
+            code: 'PHARMACY_NOT_FOUND',
+            error: `The pharmacy "${String(pharmacyId).trim()}" for this medicine is not registered to receive orders.`,
+          });
+        }
+        if (!pharmacyCart.items.every((item) => {
+          if (!item.medicine) return false;
+          const owner = String(item.medicine?.pharmacy || '').trim();
+          return owner.toLowerCase() === pharmacy.name.trim().toLowerCase() || owner === String(pharmacy._id);
+        })) {
+          return res.status(400).json({ error: 'All medicines in the cart must belong to the selected pharmacy' });
+        }
       }
 
       const subtotalCents = pharmacyCart.items.reduce((sum, item) => {
@@ -836,7 +870,7 @@ router.post('/pay-provider', auth, async (req, res) => {
       return res.status(400).json({ error: 'A valid payment amount is required' });
     }
 
-    const provider = pharmacy ? null : await Provider.findById(providerId);
+    const provider = pharmacy ? null : (qureoCatalogProvider || await Provider.findById(providerId));
     if (!pharmacy && !provider) return res.status(404).json({ error: 'Provider not found' });
 
     const session = await mongoose.startSession();
@@ -907,7 +941,8 @@ router.post('/pay-provider', auth, async (req, res) => {
         );
         if (wallet2.status !== 'active') throw new Error('Provider wallet is not active');
         const providerPreviousBalance = wallet2.balance;
-        providerNewBalance = providerPreviousBalance + paymentAmount;
+        const providerCreditAmount = isQureoGeneralOrder ? pharmacySubtotal : paymentAmount;
+        providerNewBalance = providerPreviousBalance + providerCreditAmount;
         wallet2.balance = providerNewBalance;
         wallet2.lastTransaction = new Date();
         await wallet2.save({ session });
@@ -917,7 +952,7 @@ router.post('/pay-provider', auth, async (req, res) => {
       const transaction = new Transaction({
         wallet: wallet._id,
         user: userId,
-        ...(pharmacy ? {} : { provider: providerId }),
+        ...(pharmacy ? {} : { provider: provider._id }),
         type,
         amount: paymentAmount,
         previousBalance,
@@ -930,6 +965,13 @@ router.post('/pay-provider', auth, async (req, res) => {
         metadata: {
           serviceDetails,
           ...(consultationBookingReference ? { consultationBookingReference: String(consultationBookingReference) } : {}),
+          ...(isQureoGeneralOrder ? {
+            qureoManagedCatalog: true,
+            merchantProviderId: String(provider._id),
+            merchantName: provider.name,
+            pharmacySubtotal,
+            checkoutFees: paymentAmount - pharmacySubtotal,
+          } : {}),
           ...(pharmacy ? {
             pharmacyId: String(pharmacy._id),
             pharmacySubtotal,
@@ -966,6 +1008,9 @@ router.post('/pay-provider', auth, async (req, res) => {
           customer: userId,
         }], { session });
 
+      }
+
+      if (pharmacy || isQureoGeneralOrder) {
         const order = new Order({
           user: userId,
           items: pharmacyCart.items.map((item) => ({
@@ -975,7 +1020,12 @@ router.post('/pay-provider', auth, async (req, res) => {
             price: Number(item.medicine.price),
           })),
           totalPrice: paymentAmount,
-          pharmacy: pharmacy._id,
+          ...(pharmacy ? { pharmacy: pharmacy._id } : {}),
+          ...(isQureoGeneralOrder ? {
+            merchantProvider: provider._id,
+            merchantName: QUREO_GENERAL_PROVIDER_NAME,
+            fulfillmentSource: 'qureo_catalog',
+          } : {}),
           paymentMethod: 'Qureo-Wallet',
           paymentStatus: 'paid',
           paymentTransaction: transaction._id,
@@ -1007,8 +1057,9 @@ router.post('/pay-provider', auth, async (req, res) => {
           route: '/health-wallet',
           data: {
             transactionId: String(transaction._id),
-            ...(providerId ? { providerId: String(providerId) } : {}),
+            ...(provider ? { providerId: String(provider._id) } : {}),
             ...(pharmacy ? { pharmacyId: String(pharmacy._id) } : {}),
+            ...(isQureoGeneralOrder ? { providerId: String(provider._id) } : {}),
             amount: String(paymentAmount.toFixed(2)),
           },
         });
@@ -1018,12 +1069,12 @@ router.post('/pay-provider', auth, async (req, res) => {
 
       res.json({
         success: true,
-        message: `Payment to ${pharmacy?.name || provider?.email} successful`,
+        message: `Payment to ${pharmacy?.name || provider?.name || provider?.email} successful`,
         newBalance,
         transactionId: transaction._id,
-        ...(pharmacy ? {
-          pharmacyId: String(pharmacy._id),
-          pharmacyWalletBalance: providerNewBalance,
+        ...(pharmacy || isQureoGeneralOrder ? {
+          ...(pharmacy ? { pharmacyId: String(pharmacy._id), pharmacyWalletBalance: providerNewBalance } : {}),
+          ...(isQureoGeneralOrder ? { providerId: String(provider._id), providerWalletBalance: providerNewBalance } : {}),
           pharmacyEarnings: pharmacySubtotal,
           orderId: transaction.metadata.orderId,
         } : {}),
