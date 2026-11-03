@@ -59,6 +59,9 @@ const NOTIFICATION_TYPE_MAP = {
   ai_recommendation: { category: 'ai_assistant' },
 
   consultation_booked: { category: 'doctor_consultations' },
+  consultation_awaiting_confirmation: { category: 'doctor_consultations' },
+  consultation_confirmed: { category: 'doctor_consultations' },
+  consultation_rejected: { category: 'doctor_consultations' },
   consultation_30min: { category: 'doctor_consultations' },
   consultation_starting_soon: { category: 'doctor_consultations' },
   consultation_started: { category: 'doctor_consultations' },

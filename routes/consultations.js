@@ -14,6 +14,7 @@ const { requireAdmin } = require("../middleware/adminAuth");
 const doctorAuth = require('../middleware/doctorAuth');
 const moment = require("moment-timezone");
 const sendEmail = require("../utils/email");
+const sendSMS = require("../utils/sms");
 const { notifyUser } = require("../utils/notifyUser");
 const {
   getDoctorAcceptanceStatuses,
@@ -102,6 +103,45 @@ const notifyViaAllChannels = async ({
 
   console.log("🔥 notifyViaAllChannels RESULTS:", results);
 
+  return results;
+};
+
+const notifyPatientConsultation = async ({ consultation, type, title, body, refundStatus }) => {
+  const patientProfile = await Profile.findOne({ user: consultation.patient }).select('phone').lean().catch(() => null);
+  const data = {
+    consultationId: String(consultation._id),
+    roomId: consultation.roomId,
+    status: consultation.status,
+    ...(refundStatus ? { refundStatus } : {}),
+    route: '/appoint',
+  };
+
+  const tasks = [
+    NotificationEvent.create({
+      userId: consultation.patient,
+      type,
+      title,
+      body,
+      icon: '🩺',
+      data,
+    }),
+    notifyUser({ userId: consultation.patient, type, title, body, route: '/appoint', data }),
+    sendSMS(consultation.patientPhone || consultation.patient_?.phone || patientProfile?.phone, `Qureo: ${body}`),
+    sendEmail(
+      consultation.patientEmail || consultation.patient_?.email,
+      title,
+      body
+    ),
+  ];
+
+  const results = await Promise.allSettled(tasks);
+  results.forEach((result, index) => {
+    if (result.status === 'rejected') {
+      console.error(`[consultations] Patient notification channel ${index + 1} failed:`, result.reason?.message || result.reason);
+    } else if (index === 2 && result.value?.sent === false) {
+      console.warn('[consultations] Patient SMS was not sent:', result.value.reason);
+    }
+  });
   return results;
 };
 
@@ -838,6 +878,10 @@ router.put('/:id/confirm', doctorAuth, async (req, res) => {
       return res.status(403).json({ message: 'Only assigned doctor can confirm this booking' });
     }
 
+    if (consultation.confirmedByDoctorId && consultation.confirmedAt) {
+      return res.json(consultation);
+    }
+
     if (!canDoctorAcceptConsultation(consultation.status)) {
       return res.status(400).json({ message: 'Only awaiting confirmation, pending, or scheduled consultations can be accepted' });
     }
@@ -848,21 +892,12 @@ router.put('/:id/confirm', doctorAuth, async (req, res) => {
     consultation.updatedAt = new Date();
     await consultation.save();
 
-    const patientMessage = `Your consultation with ${consultation?.doctor_?.name || 'doctor'} is confirmed for ${new Date(consultation.appointmentTime).toLocaleString()}.`;
-    await notifyViaAllChannels({
-      ownerId: consultation.patient,
-      email: consultation.patientEmail || consultation?.patient_?.email,
-      phone: consultation.patientPhone || consultation?.patient_?.phone,
-      subject: 'Consultation confirmed',
-      text: patientMessage,
-      pushTitle: 'Consultation confirmed',
-      pushBody: patientMessage,
-      pushData: { 
-        consultationId: String(consultation._id), 
-        status: consultation.status, 
-        type: 'consultation_confirmed',
-        route: '/notification', // Links to notifications page for consultation details
-      },
+    const patientMessage = `Your consultation with ${consultation?.doctor_?.name || req.doctor?.name || 'your doctor'} is confirmed for ${new Date(consultation.appointmentTime).toLocaleString()}.`;
+    await notifyPatientConsultation({
+      consultation,
+      type: 'consultation_confirmed',
+      title: 'Consultation confirmed',
+      body: patientMessage,
     });
 
     res.json(consultation);
@@ -911,41 +946,53 @@ router.put('/:id/reject', doctorAuth, async (req, res) => {
           refundStatus = 'completed';
         } else {
           const [patientWallet, recipientWallet] = await Promise.all([
-            Wallet.findOne({ user: payment.user }).session(session),
-            payment.provider ? Wallet.findOne({ user: payment.provider }).session(session) : null,
+            Wallet.findOneAndUpdate(
+              { user: payment.user },
+              { $setOnInsert: { balance: 0, currency: 'USD', status: 'active' } },
+              { upsert: true, new: true, setDefaultsOnInsert: true, session }
+            ),
+            payment.provider
+              ? Wallet.findOneAndUpdate(
+                  { user: payment.provider },
+                  { $setOnInsert: { balance: 0, currency: 'USD', status: 'active' } },
+                  { upsert: true, new: true, setDefaultsOnInsert: true, session }
+                )
+              : null,
           ]);
-          if (!patientWallet || !recipientWallet || Number(recipientWallet.balance) < Number(payment.amount)) {
-            refundStatus = 'failed';
-          } else {
-            const amount = Number(payment.amount);
-            const patientPreviousBalance = Number(patientWallet.balance || 0);
-            const recipientPreviousBalance = Number(recipientWallet.balance || 0);
-            patientWallet.balance = patientPreviousBalance + amount;
-            patientWallet.totalDeposits = Number(patientWallet.totalDeposits || 0) + amount;
-            patientWallet.lastTransaction = new Date();
-            recipientWallet.balance = recipientPreviousBalance - amount;
+          if (!patientWallet) {
+            throw new Error('Patient wallet not found for consultation refund');
+          }
+          const amount = Number(payment.amount);
+          const patientPreviousBalance = Number(patientWallet.balance || 0);
+          patientWallet.balance = patientPreviousBalance + amount;
+          patientWallet.totalDeposits = Number(patientWallet.totalDeposits || 0) + amount;
+          patientWallet.lastTransaction = new Date();
+          const walletUpdates = [patientWallet.save({ session })];
+          if (recipientWallet) {
+            recipientWallet.balance = Number(recipientWallet.balance || 0) - amount;
             recipientWallet.totalWithdrawals = Number(recipientWallet.totalWithdrawals || 0) + amount;
             recipientWallet.lastTransaction = new Date();
-            await Promise.all([patientWallet.save({ session }), recipientWallet.save({ session })]);
-
-            await Transaction.create([{
-              wallet: patientWallet._id,
-              user: payment.user,
-              provider: payment.provider,
-              type: 'refund',
-              amount,
-              previousBalance: patientPreviousBalance,
-              newBalance: patientWallet.balance,
-              status: 'completed',
-              paymentMethod: 'wallet',
-              description: `Refund for rejected consultation ${consultation._id}`,
-              reference: `CONSULTATION-REFUND-${payment._id}`,
-              refundOf: payment._id,
-              metadata: { consultationId: String(consultation._id) },
-              completedAt: new Date(),
-            }], { session });
-            refundStatus = 'completed';
+            walletUpdates.push(recipientWallet.save({ session }));
           }
+          await Promise.all(walletUpdates);
+
+          await Transaction.create([{
+            wallet: patientWallet._id,
+            user: payment.user,
+            provider: payment.provider,
+            type: 'refund',
+            amount,
+            previousBalance: patientPreviousBalance,
+            newBalance: patientWallet.balance,
+            status: 'completed',
+            paymentMethod: 'wallet',
+            description: `Refund for rejected consultation ${consultation._id}`,
+            reference: `CONSULTATION-REFUND-${payment._id}`,
+            refundOf: payment._id,
+            metadata: { consultationId: String(consultation._id) },
+            completedAt: new Date(),
+          }], { session });
+          refundStatus = 'completed';
         }
 
         consultation.status = 'cancelled';
@@ -971,26 +1018,18 @@ router.put('/:id/reject', doctorAuth, async (req, res) => {
       await consultation.save();
     }
 
+    const doctorName = req.doctor?.name || consultation?.doctor_?.name || 'your doctor';
     const notificationBody = refundStatus === 'completed'
-      ? `Your consultation with ${req.doctor.name} was declined. The full payment has been returned to your Qureo wallet.`
+      ? `Your consultation with ${doctorName} was declined. The full payment has been returned to your Qureo wallet.`
       : refundStatus === 'failed'
-        ? `Your consultation with ${req.doctor.name} was declined. We could not complete the automatic refund; please contact support.`
-        : `Your consultation with ${req.doctor.name} was declined. No linked wallet payment was found, so no automatic refund was made.`;
-    await notifyUser({
-      userId: consultation.patient,
+        ? `Your consultation with ${doctorName} was declined. We could not complete the automatic refund; please contact support.`
+        : `Your consultation with ${doctorName} was declined. No linked wallet payment was found, so no automatic refund was made.`;
+    await notifyPatientConsultation({
+      consultation,
       type: 'consultation_rejected',
       title: 'Consultation declined',
       body: notificationBody,
-      balancedTitle: 'Consultation declined',
-      balancedBody: notificationBody,
-      genericTitle: 'Consultation update',
-      genericBody: 'Your doctor declined the consultation request.',
-      route: '/appoint',
-      data: {
-        consultationId: String(consultation._id),
-        status: consultation.status,
-        refundStatus,
-      },
+      refundStatus,
     });
     return res.json({ consultation, refundStatus });
   } catch (err) {
