@@ -802,7 +802,12 @@ router.post('/pay-provider', auth, async (req, res) => {
         ? await Pharmacy.findById(pharmacyId)
         : await Pharmacy.findOne({ name: { $regex: `^${String(pharmacyId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' } });
 
-      if (!pharmacy) return res.status(404).json({ error: 'Pharmacy not found for this purchase' });
+      if (!pharmacy) {
+        return res.status(404).json({
+          code: 'PHARMACY_NOT_FOUND',
+          error: `The pharmacy "${String(pharmacyId).trim()}" for this medicine is not registered to receive orders.`,
+        });
+      }
       if (!pharmacyCart.items.every((item) => {
         if (!item.medicine) return false;
         const owner = String(item.medicine?.pharmacy || '').trim();
