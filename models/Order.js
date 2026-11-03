@@ -18,7 +18,7 @@ const orderSchema = new mongoose.Schema({
   fulfillmentSource: { type: String, enum: ['pharmacy', 'qureo_catalog'], default: 'pharmacy' },
   status: {
     type: String,
-    enum: ['Pending', 'Processing', 'Completed', 'Cancelled'],
+    enum: ['Pending', 'Processing', 'Shipped', 'Delivered', 'Completed', 'Cancelled'],
     default: 'Pending'
   },
   deliveryInfo: {

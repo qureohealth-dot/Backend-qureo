@@ -9,6 +9,7 @@ const Order = require("../models/Order");
 const PharmacyWallet = require("../models/PharmacyWallet");
 const PharmacyWalletTransaction = require("../models/PharmacyWalletTransaction");
 const pharmacyAuth = require("../middleware/pharmacyAuth");
+const { normalizeOrderStatus, notifyPatientOrderStatus } = require('../services/orderStatusNotifications');
 
 const JWT_SECRET = process.env.JWT_SECRET || process.env.AUTH_SECRET ||
   (process.env.NODE_ENV === "production" ? "" : "qureo-local-dev-auth-secret");
@@ -229,7 +230,7 @@ router.get("/me/orders", pharmacyAuth, async (req, res) => {
 
 router.patch("/me/orders/:id/status", pharmacyAuth, async (req, res) => {
   try {
-    const { status } = req.body;
+    const status = normalizeOrderStatus(req.body?.status);
     if (!['Processing', 'Completed'].includes(status)) {
       return res.status(400).json({ message: "Unsupported order status" });
     }
@@ -245,8 +246,12 @@ router.patch("/me/orders/:id/status", pharmacyAuth, async (req, res) => {
       return res.status(409).json({ message: "Order cannot move to the requested status" });
     }
 
+    const previousStatus = order.status;
     order.status = status;
     await order.save();
+    if (previousStatus !== order.status) {
+      await notifyPatientOrderStatus(order);
+    }
     res.json({ order });
   } catch (err) {
     res.status(500).json({ message: "Failed to update order", error: err.message });
