@@ -2,7 +2,6 @@ const express = require('express');
 const router = express.Router();
 const HealthAssessment = require('../models/HealthAssessment');
 const auth = require('../middleware/auth');
-const { sendOtp, verifyOtp } = require('../services/twilioVerify');
 const { notifyUser } = require('../utils/notifyUser');
 
 function normalizeText(value) {
@@ -223,56 +222,6 @@ async function upsertSingleAssessment(req, res) {
     res.status(500).json({ message: 'Server error' });
   }
 }
-
-// POST /api/assessment/phone/send-code
-router.post('/phone/send-code', auth, async (req, res) => {
-  try {
-    if (!req.userId) {
-      return res.status(401).json({ message: 'Sign in is required.' });
-    }
-    const result = await sendOtp({
-      phone: req.body?.phone,
-      userId: req.userId,
-      channel: 'sms',
-    });
-    return res.json({
-      sent: true,
-      status: result.status,
-      phone: result.to,
-      ...(result.provider === 'dev-fallback' && result.developmentCode
-        ? { developmentCode: result.developmentCode }
-        : {}),
-    });
-  } catch (err) {
-    const status = err?.code === 'INVALID_PHONE' ? 400 : 502;
-    return res.status(status).json({ message: err?.message || 'Unable to send verification code.' });
-  }
-});
-
-// POST /api/assessment/phone/verify-code
-router.post('/phone/verify-code', auth, async (req, res) => {
-  try {
-    if (!req.userId) {
-      return res.status(401).json({ message: 'Sign in is required.' });
-    }
-    const result = await verifyOtp({
-      phone: req.body?.phone,
-      userId: req.userId,
-      code: req.body?.code,
-    });
-    if (!result.approved) {
-      return res.status(400).json({
-        approved: false,
-        status: result.status,
-        message: 'The verification code is incorrect or has expired.',
-      });
-    }
-    return res.json({ approved: true, status: result.status });
-  } catch (err) {
-    const status = ['INVALID_PHONE', 'INVALID_OTP'].includes(err?.code) ? 400 : 502;
-    return res.status(status).json({ message: err?.message || 'Unable to verify code.' });
-  }
-});
 
 // POST /api/assessment - create or update the single assessment record
 router.post('/', auth, upsertSingleAssessment);

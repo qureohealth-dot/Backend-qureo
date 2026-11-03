@@ -59,18 +59,6 @@ router.get('/', auth, requireAdmin, async (req, res) => {
     checks.push(Promise.resolve(configuredService('Stripe', 'Payment gateway', false, 'Secret key is not configured')));
   }
 
-  if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_VERIFY_SERVICE_SID) {
-    checks.push(probeService('Twilio Verify', 'Messaging API', () => axios.get(
-      `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(process.env.TWILIO_ACCOUNT_SID)}.json`,
-      {
-        timeout: PROBE_TIMEOUT_MS,
-        auth: { username: process.env.TWILIO_ACCOUNT_SID, password: process.env.TWILIO_AUTH_TOKEN },
-      },
-    )));
-  } else {
-    checks.push(Promise.resolve(configuredService('Twilio Verify', 'Messaging API', false, 'Account or Verify credentials are not configured')));
-  }
-
   if (process.env.OPENAI_API_KEY) {
     checks.push(probeService('OpenAI', 'AI API', () => axios.get('https://api.openai.com/v1/models', {
       timeout: PROBE_TIMEOUT_MS,

@@ -14,7 +14,6 @@ const { requireAdmin } = require("../middleware/adminAuth");
 const doctorAuth = require('../middleware/doctorAuth');
 const moment = require("moment-timezone");
 const sendEmail = require("../utils/email");
-const sendSMS = require("../utils/sms");
 const { notifyUser } = require("../utils/notifyUser");
 const {
   getDoctorAcceptanceStatuses,
@@ -70,7 +69,6 @@ const isSlotAvailableFromDoctorSchedule = (doctor, appointmentTime) => {
 const notifyViaAllChannels = async ({
   ownerId,
   email,
-  phone,
   subject,
   text,
   pushTitle,
@@ -84,10 +82,6 @@ const notifyViaAllChannels = async ({
 
   const results = await Promise.allSettled([
     sendEmail(email, subject, text),
-    sendSMS(phone, text),
-    sendSMS.sendWhatsApp
-      ? sendSMS.sendWhatsApp(phone, text)
-      : Promise.resolve(false),
 
     (async () => {
       console.log("🔥 ABOUT TO CALL notifyUser()");
@@ -190,18 +184,12 @@ const resolveDurationMinutes = (duration, durationMinutes) => {
                 try { doctorContact = await Doctor.findById(c.doctor).lean(); } catch (e) { doctorContact = null; }
               }
               const doctorEmail = doctorContact && (doctorContact.email || doctorContact.emailAddress);
-              const doctorPhone = doctorContact && (doctorContact.phone || doctorContact.mobile || doctorContact.phoneNumber);
               const docName = doctorContact && (doctorContact.name || doctorContact.fullName) || 'Doctor';
               if (doctorEmail) {
                 const subjectDoc = `Upcoming consultation with ${c.patient_?.name || 'a patient'} in 30 minutes`;
                 const textDoc = `Hi ${docName},\n\nYou have a consultation scheduled with ${c.patient_?.name || 'a patient'} at ${new Date(c.appointmentTime).toLocaleString()}. This is a 30-minute reminder.\n\nThanks.`;
                 await sendEmail(doctorEmail, subjectDoc, textDoc);
               }
-              if (doctorPhone) {
-                const sms = `Reminder: consultation with ${c.patient_?.name || 'a patient'} in 30 minutes at ${new Date(c.appointmentTime).toLocaleTimeString()}`;
-                await sendSMS(doctorPhone, sms);
-              }
-              
             } catch (errDocNotify) {
               console.error('[consultation-check] Failed to notify doctor (30-min):', errDocNotify);
             }
@@ -256,18 +244,12 @@ const resolveDurationMinutes = (duration, durationMinutes) => {
                 try { doctorContact = await Doctor.findById(c.doctor).lean(); } catch (e) { doctorContact = null; }
               }
               const doctorEmail = doctorContact && (doctorContact.email || doctorContact.emailAddress);
-              const doctorPhone = doctorContact && (doctorContact.phone || doctorContact.mobile || doctorContact.phoneNumber);
               const docName = doctorContact && (doctorContact.name || doctorContact.fullName) || 'Doctor';
               if (doctorEmail) {
                 const subjectDoc = `Consultation starting now with ${c.patient_?.name || 'a patient'}`;
                 const textDoc = `Hi ${docName},\n\nYour consultation with ${c.patient_?.name || 'a patient'} scheduled for ${new Date(c.appointmentTime).toLocaleString()} is starting now. Please join the session.\n\nJoin here: https://qureo.vercel.app/call/${c.roomId}`;
                 await sendEmail(doctorEmail, subjectDoc, textDoc);
                 console.log(`[consultation-check] Sent start email to doctor ${doctorEmail}`);
-              }
-              if (doctorPhone) {
-                const sms = `Call starting: consultation with ${c.patient_?.name || 'a patient'} now — join room ${c.roomId}`;
-                await sendSMS(doctorPhone, sms);
-                console.log(`[consultation-check] Sent start SMS to doctor ${doctorPhone}`);
               }
             } catch (errDocNotify) {
               console.error('[consultation-check] Failed to notify doctor (start):', errDocNotify);
