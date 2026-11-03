@@ -2,6 +2,9 @@ const axios = require('axios');
 
 const BASE_URL = (process.env.MTN_MOMO_BASE_URL || 'https://sandbox.momodeveloper.mtn.com').replace(/\/$/, '');
 const TARGET_ENVIRONMENT = process.env.MTN_MOMO_TARGET_ENVIRONMENT || 'sandbox';
+const TOKEN_TIMEOUT_MS = Number(process.env.MTN_MOMO_TOKEN_TIMEOUT_MS) > 0
+  ? Number(process.env.MTN_MOMO_TOKEN_TIMEOUT_MS)
+  : 30000;
 let tokenCache = null;
 
 const getProviderErrorDetail = (data) => {
@@ -33,7 +36,7 @@ const getAccessToken = async () => {
     response = await axios.post(`${BASE_URL}/collection/token/`, null, {
       auth: { username: config.apiUser, password: config.apiKey },
       headers: { 'Ocp-Apim-Subscription-Key': config.subscriptionKey },
-      timeout: 15000,
+      timeout: TOKEN_TIMEOUT_MS,
     });
   } catch (error) {
     const status = error.response?.status || 'unknown';
