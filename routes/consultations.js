@@ -1127,11 +1127,17 @@ router.put("/:id/complete", consultationActorAuth, async (req, res) => {
 });
 
 // Create doctor-issued prescription records for the consultation patient
-router.post("/:id/prescription/create", async (req, res) => {
+router.post("/:id/prescription/create", doctorAuth, async (req, res) => {
   try {
+    if (!req.doctorId) {
+      return res.status(401).json({ success: false, error: 'Doctor authentication required' });
+    }
     const consultation = await Consultation.findById(req.params.id);
     if (!consultation) {
       return res.status(404).json({ success: false, error: "Consultation not found" });
+    }
+    if (String(consultation.doctor) !== String(req.doctorId)) {
+      return res.status(403).json({ success: false, error: 'Only the assigned doctor can prescribe for this consultation' });
     }
 
     const medicines = Array.isArray(req.body?.medicines)
@@ -1146,8 +1152,8 @@ router.post("/:id/prescription/create", async (req, res) => {
       source: "doctor_consultation",
       consultationId: consultation._id,
       patientId: consultation.patient,
-      doctorId: consultation.doctor,
-      doctorName: consultation?.doctor_?.name || "Doctor",
+      doctorId: req.doctorId,
+      doctorName: req.doctor?.name || consultation?.doctor_?.name || "Doctor",
       instructions: req.body?.instructions || "",
       followUpDate: req.body?.followUpDate || null,
       diagnosis: req.body?.diagnosis || "",
