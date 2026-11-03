@@ -22,6 +22,7 @@ const { randomUUID } = require('crypto');
 const { createCollection, getCollectionStatus } = require('../services/dollr');
 const { createRequestToPay, getRequestToPayStatus } = require('../services/mtnMobileMoney');
 const { QUREO_CATALOG_SELLER, isQureoGeneralCatalogOrder } = require('../lib/catalogMerchant');
+const { creditSuccessfulStripePayment } = require('../services/stripeWalletFunding');
 
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -703,15 +704,17 @@ router.post("/top-up", async (req, res) => {
 
 // Add money to wallet
 // This should ONLY create Stripe PaymentIntent
-router.post('/deposit', async (req, res) => {
+router.post('/deposit', auth, async (req, res) => {
   try {
-    const { userId, amount } = req.body;
+    const userId = req.userId;
+    const { amount } = req.body;
 
-    if (!userId) return res.status(400).json({ error: 'userId required' });
-    if (!amount || amount <= 0) return res.status(400).json({ error: 'Invalid amount' });
+    if (!Number.isFinite(Number(amount)) || Number(amount) <= 0) {
+      return res.status(400).json({ error: 'Invalid amount' });
+    }
 
     const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(amount * 100),
+      amount: Math.round(Number(amount) * 100),
       currency: 'usd',
       metadata: { userId },
       automatic_payment_methods: { enabled: true }
@@ -723,6 +726,34 @@ router.post('/deposit', async (req, res) => {
 
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/deposit/confirm', auth, async (req, res) => {
+  try {
+    const paymentIntentId = String(req.body?.paymentIntentId || '').trim();
+    if (!paymentIntentId) return res.status(400).json({ error: 'paymentIntentId is required' });
+
+    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+    if (String(paymentIntent.metadata?.userId || '') !== String(req.userId)) {
+      return res.status(403).json({ error: 'PaymentIntent does not belong to this account' });
+    }
+    if (paymentIntent.status !== 'succeeded') {
+      return res.status(409).json({ error: 'Stripe payment has not succeeded' });
+    }
+
+    const result = await creditSuccessfulStripePayment(paymentIntent);
+    const wallet = result.wallet || await Wallet.findOne({ user: req.userId });
+    return res.json({
+      success: true,
+      credited: result.credited,
+      message: result.credited ? 'Wallet funded successfully' : 'This Stripe payment was already added',
+      transactionId: result.transaction?._id,
+      balance: wallet?.balance ?? null,
+    });
+  } catch (error) {
+    console.error('[wallet] Stripe deposit confirmation failed:', error.message);
+    return res.status(500).json({ error: error.message || 'Failed to confirm Stripe wallet deposit' });
   }
 });
 
@@ -1115,6 +1146,9 @@ router.post('/funding-source/add', auth, async (req, res) => {
     if (!amount || Number(amount) <= 0) return res.status(400).json({ error: 'Invalid amount' });
 
     const normalizedSource = String(sourceType).toLowerCase();
+    if (normalizedSource === 'card') {
+      return res.status(400).json({ error: 'Card funding must be confirmed through Stripe before wallet credit.' });
+    }
     const bucketKey = SOURCE_TO_BUCKET[normalizedSource];
     if (!bucketKey) {
       return res.status(400).json({ error: 'Unsupported sourceType' });

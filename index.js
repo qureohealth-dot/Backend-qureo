@@ -116,16 +116,6 @@ const auth = authMiddleware;
 
 
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-
-
-
-
-
-
-
 app.post(
   "/api/wallet/webhook",
   express.raw({ type: "application/json" }),
@@ -146,80 +136,22 @@ app.post(
 
     console.log("✅ Webhook verified:", event.type);
 
-    // 🔥 Handle successful payment
     if (event.type === 'payment_intent.succeeded') {
-   
-         const paymentIntent = event.data.object;
-         const userId = paymentIntent.metadata.userId;
-         const amount = paymentIntent.amount / 100;
-         console.log("payment succeed")
-         // 🔥 Prevent duplicate credits
-         const existingTransaction = await Transaction.findOne({
-           stripePaymentIntentId: paymentIntent.id
-         });
-   
-         if (existingTransaction) {
-           return res.json({ received: true });
-         }
-   
-         const session = await mongoose.startSession();
-         session.startTransaction();
-   
-         try {
-           let wallet = await Wallet.findOne({ user: userId }).session(session);
-   
-           if (!wallet) {
-             wallet = new Wallet({
-               user: userId,
-               balance: 0,
-               currency: 'USD',
-               totalDeposits: 0
-             });
-           }
-   
-           const previousBalance = wallet.balance;
-           const newBalance = previousBalance + amount;
-   
-           wallet.balance = newBalance;
-           wallet.totalDeposits += amount;
-           wallet.lastTransaction = new Date();
-           await wallet.save({ session });
-   
-           const transaction = new Transaction({
-             wallet: wallet._id,
-             user: userId,
-             type: 'deposit',
-             amount,
-             previousBalance,
-             newBalance,
-             status: 'completed',
-             paymentMethod: 'stripe',
-             stripePaymentIntentId: paymentIntent.id, // 🔐 critical
-             description: `Stripe deposit of $${amount}`,
-             reference: `STRIPE-${paymentIntent.id}`,
-             completedAt: new Date()
-           });
-   
-           await transaction.save({ session });
-   
-           await session.commitTransaction();
-           session.endSession();
-   
-         } catch (error) {
-           await session.abortTransaction();
-           session.endSession();
-           console.error(error);
-         }
-       }
-   
-       res.json({ received: true });
-
+      try {
+        const { creditSuccessfulStripePayment } = require('./services/stripeWalletFunding');
+        await creditSuccessfulStripePayment(event.data.object);
+      } catch (error) {
+        console.error('[stripe-webhook] Wallet credit failed:', error.message);
+        return res.status(500).json({ received: false });
       }
+    }
+
+    return res.json({ received: true });
+  }
 );
 
-// Webhook route ABOVE
-
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
 

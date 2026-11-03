@@ -8,6 +8,10 @@ const HealthPlan = require('../models/HealthPlan');
 const User = require('../models/User');
 const NodeCache = require('node-cache');
 const { notifyUser } = require('../utils/notifyUser');
+const {
+  getVitalAlertRepeatMinutes,
+  shouldRepeatVitalAlert: hasRepeatIntervalElapsed,
+} = require('../lib/vitalAlertCadence');
 
 /**
  * HEALTH MONITORING ALGORITHM - ENHANCED WITH OPENAI & SCALABILITY
@@ -24,8 +28,6 @@ const { notifyUser } = require('../utils/notifyUser');
 // Initialize cache (60 second TTL for health records, 5 min for AI insights)
 const healthRecordCache = new NodeCache({ stdTTL: 60 });
 const aiInsightCache = new NodeCache({ stdTTL: 300 });
-const WARNING_VITAL_REPEAT_MINUTES = Math.max(10, Number(process.env.WARNING_VITAL_REPEAT_MINUTES) || 30);
-const CRITICAL_VITAL_REPEAT_MINUTES = Math.max(5, Number(process.env.CRITICAL_VITAL_REPEAT_MINUTES) || 10);
 
 const latestMeasurement = (entries) => {
   if (!Array.isArray(entries) || entries.length === 0) return null;
@@ -555,10 +557,8 @@ class HealthMonitoringService {
       .sort({ createdAt: -1 }).select('createdAt').lean();
 
     if (!previousAlert) return true;
-    const intervalMinutes = alert.severity === 'critical'
-      ? CRITICAL_VITAL_REPEAT_MINUTES
-      : WARNING_VITAL_REPEAT_MINUTES;
-    return now.getTime() - new Date(previousAlert.createdAt).getTime() >= intervalMinutes * 60 * 1000;
+    const intervalMinutes = getVitalAlertRepeatMinutes(alert.severity);
+    return hasRepeatIntervalElapsed(previousAlert.createdAt, intervalMinutes, now);
   }
 
   /**
