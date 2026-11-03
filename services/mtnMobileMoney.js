@@ -38,7 +38,12 @@ const getAccessToken = async () => {
   } catch (error) {
     const status = error.response?.status || 'unknown';
     const detail = getProviderErrorDetail(error.response?.data);
-    throw new Error(`MTN MoMo token request failed (HTTP ${status})${detail ? `: ${detail}` : ''}`);
+    const transportDetail = !error.response
+      ? [error.code, error.message].filter(Boolean).join(': ')
+      : '';
+    throw new Error(
+      `MTN MoMo token request failed (HTTP ${status})${detail ? `: ${detail}` : ''}${transportDetail ? ` (${transportDetail})` : ''}`
+    );
   }
 
   const token = response.data?.access_token;
