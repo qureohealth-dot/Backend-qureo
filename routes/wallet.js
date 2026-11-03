@@ -21,6 +21,7 @@ const auth = require('../middleware/auth');
 const { randomUUID } = require('crypto');
 const { createCollection, getCollectionStatus } = require('../services/dollr');
 const { createRequestToPay, getRequestToPayStatus } = require('../services/mtnMobileMoney');
+const { QUREO_CATALOG_SELLER, isQureoGeneralCatalogOrder } = require('../lib/catalogMerchant');
 
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -59,7 +60,6 @@ const SOURCE_TO_BUCKET = {
   family_support: 'familySupport',
 };
 
-const QUREO_CATALOG_SELLER = 'qureo pharmacy';
 const QUREO_GENERAL_PROVIDER_NAME = 'QUREO GENERAL DASHBOARD';
 
 const resolveQureoGeneralProvider = async () => {
@@ -815,12 +815,7 @@ router.post('/pay-provider', auth, async (req, res) => {
         return res.status(400).json({ error: 'Your medicine cart is empty' });
       }
 
-      const sellerNames = [...new Set(pharmacyCart.items.map((item) =>
-        String(item.medicine?.pharmacy || '').trim().toLowerCase()
-      ))];
-      isQureoGeneralOrder =
-        String(pharmacyId).trim().toLowerCase() === QUREO_CATALOG_SELLER &&
-        sellerNames.length === 1 && sellerNames[0] === QUREO_CATALOG_SELLER;
+      isQureoGeneralOrder = isQureoGeneralCatalogOrder(pharmacyId, pharmacyCart.items);
 
       if (isQureoGeneralOrder) {
         qureoCatalogProvider = await resolveQureoGeneralProvider();
@@ -935,7 +930,7 @@ router.post('/pay-provider', auth, async (req, res) => {
         await pharmacyWallet.save({ session });
       } else {
         wallet2 = await Wallet.findOneAndUpdate(
-          { user: providerId },
+          { user: provider._id },
           { $setOnInsert: { balance: 0, currency: 'USD', status: 'active' } },
           { upsert: true, new: true, setDefaultsOnInsert: true, session }
         );

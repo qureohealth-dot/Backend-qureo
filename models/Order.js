@@ -13,6 +13,9 @@ const orderSchema = new mongoose.Schema({
   ],
   totalPrice: { type: Number, required: true },
   pharmacy: { type: mongoose.Schema.Types.ObjectId, ref: 'Pharmacy' },
+  merchantProvider: { type: mongoose.Schema.Types.ObjectId, ref: 'Provider', default: null },
+  merchantName: { type: String, default: '' },
+  fulfillmentSource: { type: String, enum: ['pharmacy', 'qureo_catalog'], default: 'pharmacy' },
   status: {
     type: String,
     enum: ['Pending', 'Processing', 'Completed', 'Cancelled'],
